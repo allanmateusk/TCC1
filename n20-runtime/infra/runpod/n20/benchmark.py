@@ -8,14 +8,16 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 
 from sistema.scripts import runpod_worker as worker
 from sistema.scripts.runner_containers import _write as write_json_atomically
-from . import campaign
+from . import artifact_store, campaign, watchdog
 
 ROOT = Path(__file__).resolve().parents[3]
 PROFILE = Path(__file__).with_name("profile.json")
@@ -117,12 +119,41 @@ def preflight(profile, scenarios):
     print("Offline: 17 official scenarios and one separate baseline pilot; 20 BF16 processes, 10 per GPU.")
 
 
-def live(profile, scenario, seed, snapshot, out, rounds=None):
+def verify_controller_arm(path, run_dir, resource_id, run_id, *, now=None):
+    """Require separately owned controller state; deployment must also prove scheduler/TTL."""
+    if path is None or not Path(path).is_absolute() or Path(path).is_symlink():
+        raise ValueError("An independent controller arm record is required")
+    path = Path(path).resolve(strict=True)
+    if path.is_relative_to(run_dir.parent) or path.is_relative_to(ROOT.parent):
+        raise ValueError("Controller state cannot reside in the runner project or output volume")
+    state = watchdog.State.load(path)
+    binding = state.binding
+    tick = time.time() if now is None else now
+    if (binding.run_id != run_id or binding.resource_id != resource_id or binding.bucket != "tcc"
+        or not binding.armed_at <= tick < binding.deadline
+        or not 0 <= tick-state.last_seen < binding.stale_after or state.reason or state.verified_phase):
+        raise ValueError("Controller state is stale, closed or bound to another resource")
+    return binding.deadline
+
+
+def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_root=None, run_id=None,
+         controller_state=None, resource_id=None):
     if os.getenv("TCC_LIVE_N20_APPROVED") != "true":
         raise RuntimeError("Set explicit live execution approval before running.")
     if sys.platform != "linux":
         raise RuntimeError("Live launch requires a dedicated Linux CUDA runner.")
     config, entry = scenario_args(profile, scenario, seed, rounds)
+    if entry["run_kind"] != "pilot":
+        raise ValueError("Official campaign is disabled until its verified export and external lifecycle are qualified")
+    run_dir = artifact_store.durable_run(durable_root, run_id, repo=ROOT.parent)
+    provider_deadline = verify_controller_arm(controller_state, run_dir, resource_id, run_id)
+    if out is not None and out.resolve() != run_dir:
+        raise ValueError("Output must match durable-root/run-id")
+    git_sha = subprocess.check_output(["git", "-C", str(ROOT.parent), "rev-parse", "HEAD"], text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", git_sha):
+        raise ValueError("An identified Git checkout is required")
+    if subprocess.run(["git", "-C", str(ROOT.parent), "diff", "--quiet", "HEAD", "--", "n20-runtime"]).returncode:
+        raise ValueError("Live inference requires a clean tracked runtime at the recorded commit")
     snapshot = snapshot.resolve(strict=True)
     if snapshot.name != profile["model_revision"] or not (snapshot / "config.json").is_file() or not list(snapshot.glob("*.safetensors")):
         raise ValueError("Select the preinstalled snapshot pinned by profile.json.")
@@ -152,21 +183,35 @@ def live(profile, scenario, seed, snapshot, out, rounds=None):
                 raise RuntimeError(f"CUDA device {i} does not support native BF16.")
         if free_gib < required_gib:
             raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {required_gib:.2f} GiB required.")
-    out = out.resolve()
-    out.mkdir(parents=True, exist_ok=False)
+    out = run_dir
+    artifact_store.create_run_directory(out)
     check_mapping(profile, scenario, seed, out, snapshot, rounds)
     metadata = {"profile": profile, "scenario": entry, "started": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id, "experiment_id": entry["id"], "scenario_id": scenario["id"], "seed": seed,
+                "nodes": profile["nodes"], "model": profile["model"], "model_revision": profile["model_revision"],
+                "model_is_stand_in": False, "status": "running", "controller_deadline_epoch": provider_deadline,
                 "devices": [torch.cuda.get_device_name(i) for i in range(n)],
                 "vram_per_node_peak_gib": per_node_gib, "vram_required_per_gpu_gib": required_gib,
                 "vram_available_gib": free_vram_gib,
                 "run_kind": entry["run_kind"], "rounds": entry["rounds"],
                 "expected_own_generations": entry["expected_own_generations"],
                 "quantization": profile["quantization"], "dtype": profile["dtype"],
-                "completed": False, "git_sha": os.getenv("GITHUB_SHA", "")}
+                "completed": False, "git_sha": git_sha}
     record = out / "live-run.json"
     write_json_atomically(record, metadata)
-    deadline = time.monotonic() + 60 * profile["timeout_minutes"]
+    deadline = time.monotonic() + min(60 * profile["timeout_minutes"], provider_deadline - time.time())
     interrupted = False
+    last_heartbeat = -1e12
+
+    def heartbeat(force=False):
+        nonlocal last_heartbeat
+        tick = time.monotonic()
+        if force or tick - last_heartbeat >= 15:
+            artifact_store.write_atomic(out / "heartbeat.json", artifact_store.json_bytes(
+                {"run_id": run_id, "heartbeat_at_epoch": time.time()}), replace=True)
+            last_heartbeat = tick
+
+    heartbeat(force=True)
 
     def stop(_signum, _frame):
         nonlocal interrupted
@@ -175,6 +220,7 @@ def live(profile, scenario, seed, snapshot, out, rounds=None):
     def check():
         if interrupted or time.monotonic() >= deadline:
             raise InterruptedError("Live run cancelled or deadline reached.")
+        heartbeat()
 
     last = None
 
@@ -188,12 +234,20 @@ def live(profile, scenario, seed, snapshot, out, rounds=None):
     previous = {s: signal.signal(s, stop) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
         worker.execute_scenario(out, entry, config, snapshot, devices, check, progress)
+        finalized = {**metadata, "status": "verified_local", "completed": True,
+                     "verified_own_generations": entry["expected_own_generations"],
+                     "finished": datetime.now(timezone.utc).isoformat()}
+        if entry["run_kind"] == "pilot":
+            finalized = artifact_store.finalize_pilot(out, finalized)
+        artifact_store.write_atomic(record, artifact_store.json_bytes(finalized), replace=True)
+    except BaseException as exc:
+        metadata.update(status="cancelled" if isinstance(exc, InterruptedError) else "failed",
+                        failure_kind=type(exc).__name__, finished=datetime.now(timezone.utc).isoformat())
+        artifact_store.write_atomic(record, artifact_store.json_bytes(metadata), replace=True)
+        raise
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-    metadata.update(completed=True, verified_own_generations=entry["expected_own_generations"],
-                    finished=datetime.now(timezone.utc).isoformat())
-    write_json_atomically(record, metadata)
 
 
 def main():
@@ -207,7 +261,11 @@ def main():
     run.add_argument("--scenario", choices=scenarios, required=True)
     run.add_argument("--seed", choices=profile["seeds"], type=int, required=True)
     run.add_argument("--snapshot", type=Path, required=True)
-    run.add_argument("--output", type=Path, required=True)
+    run.add_argument("--durable-root", type=Path, required=True)
+    run.add_argument("--run-id", required=True)
+    run.add_argument("--controller-state", type=Path, required=True)
+    run.add_argument("--resource-id", required=True)
+    run.add_argument("--output", type=Path, help="Optional check: must equal durable-root/run-id.")
     run.add_argument("--rounds", type=int, choices=(*profile["pilot_rounds"], profile["rounds"]),
                      default=None, help="Optional check: 5 for pilot, 50 for official scenarios.")
     args = parser.parse_args()
@@ -217,7 +275,9 @@ def main():
         chosen = (scenarios[args.scenario],) if args.scenario else tuple(scenarios.values())
         print(json.dumps([scenario_args(profile, x, 0)[1] for x in chosen], indent=2))
     else:
-        live(profile, scenarios[args.scenario], args.seed, args.snapshot, args.output, args.rounds)
+        live(profile, scenarios[args.scenario], args.seed, args.snapshot, args.output, args.rounds,
+             durable_root=args.durable_root, run_id=args.run_id,
+             controller_state=args.controller_state, resource_id=args.resource_id)
 
 
 if __name__ == "__main__":

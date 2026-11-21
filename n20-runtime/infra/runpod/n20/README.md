@@ -122,15 +122,10 @@ aplica limite do job de 120 minutos. Não usa segredos de alocação nem comando
 `terraform apply`.
 
 GitHub só oferece `workflow_dispatch` se o arquivo do workflow existir também
-na branch padrão. Até isso ser aprovado e publicado lá, o GitHub executa o
-preflight no push; para execução ao vivo, após aprovação, use a CLI no próprio
-runner com o mesmo perfil:
-
-```sh
-TCC_LIVE_N20_APPROVED=true TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB="$PICO_MEDIDO_GIB" python -m infra.runpod.n20.benchmark run \
-  --scenario C05 --seed 0 --snapshot "$TCC_LIVE_N20_SNAPSHOT" \
-  --output /caminho/novo/live-n20-C05-s0
-```
+na branch padrao. Ate isso ser aprovado e publicado la, o GitHub executa o
+preflight no push; a CLI do proprio runner e a alternativa para o piloto.
+Os 17 cenarios oficiais continuam planificáveis mas bloqueados para execucao
+até qualificar o exportador de 50 rodadas e o ciclo de vida externo.
 
 O workflow antigo do projeto de origem não foi copiado. Para
 provisionar N20 mais tarde, é necessário validar uma imagem compatível com
@@ -143,11 +138,12 @@ ou serviço pago foi ativado por esta configuração.
 Execute uma combinacao por vez. Com capacidade validada e autorizacao do
 runner ja existente:
 
-\`\`\`sh
+```sh
 TCC_LIVE_N20_APPROVED=true TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB="$PICO_MEDIDO_GIB" python -m infra.runpod.n20.benchmark run \
   --scenario pilot --seed 0 --snapshot "$TCC_LIVE_N20_SNAPSHOT" \
-  --output /caminho/novo/piloto-n20-r5-s0
-\`\`\`
+  --durable-root "$TCC_N20_DURABLE_ROOT" --run-id "$N20_RUN_ID" \
+  --controller-state "$TCC_N20_CONTROLLER_STATE" --resource-id "$TCC_N20_RESOURCE_ID"
+```
 
 O manifesto separa pilot de official. O smoke sem GPU exercita HTTP e
 protocolo com um modelo substituto; nao e evidencia de inferencia BF16,
@@ -164,29 +160,69 @@ com endpoints e protocolo reais e um modelo substituto, sem CUDA.
 Verifica agenda, registros de genese, omissoes apos geracao, cadeias,
 metricas e fechamento dos processos/portas. Nenhum resultado vai ao Git.
 
-## Checklist antes do servidor: resultados e desligamento
+## Saida duravel, verificacao privada no R2 e desligamento
 
-**Hoje:** o supervisor encerra seus processos, inclusive em erro; isso
-nao encerra a alocacao do host. Nao ha upload automatico ao GitHub nem S3.
-Um teste local isolado de um modelo com adaptador temporario de leitura dos
-pesos nao qualifica a imagem Linux nem a capacidade dos 20 nos concorrentes.
-A campanha legada RunPod/R2 nao e compativel com este perfil.
+O controlador externo deve primeiro reservar um identificador aleatorio de
+32 caracteres hexadecimais minusculos (UUID sem hifens), associar esse ID ao
+recurso exato e armar o prazo de parada. Aponte TCC_N20_DURABLE_ROOT para
+um volume real, persistente e privado, fora do Git: o programa verifica o
+caminho, nao a garantia do provedor. Antes de usar o volume, valide suporte
+a fsync, publicacao atomica e hard links, e se os arquivos continuam acessiveis
+depois de desmontar a GPU. Nao use RUNNER_TEMP nem o disco descartavel do host.
+O controlador externo possui armazenamento e acesso restrito independentes do
+runner; veja [WATCHDOG.md](WATCHDOG.md). O launcher rejeita estado ausente ou
+vencido ou vinculado a outro ID/recurso. Forneca somente o estado do
+controlador por caminho separado e leitura restrita. Isso e uma trava
+de integracao, nao uma comprovacao de que o agendador externo ou TTL
+do provedor esta ativo; nao habilite o gate real sem testar ambos.
+Monte no uploader o diretorio fechado,
+sem dar ao runner acesso aos segredos ou ao estado do watchdog.
 
-**Antes de habilitar produção:**
+O runner cria o diretorio UUID uma vez, registra a SHA do checkout limpo,
+escreve live-run.json de forma atomica e emite heartbeat.json durante a
+execucao. Em falha marca failed/cancelled quando possivel e guarda os
+parciais; eles nao servem para o upload do piloto. No sucesso do piloto,
+ele confere 5 rodadas/100 geracoes, quorum registrado, 20 ledgers,
+auditoria da rodada 3 e runtime BF16 de cada no. A geracao e o upload sao
+processos separados; nenhuma chave de bucket ou de provedor entra nos
+processos de inferencia. O runner nao envia arquivos, nao encerra a
+alocacao do host e nao executa Terraform apply.
 
-1. Configurar um bucket privado S3, com criptografia, política de retenção,
-   permissão mínima para o prefixo de cada execução e credenciais da função
-   do servidor, não segredos no Git. A máquina deve poder se conectar ao S3.
-2. Persistir status e checkpoints parciais em armazenamento durável durante
-   o experimento. Enviar arquivos de produção ao prefixo único do run,
-   incluindo métricas, logs necessários, proveniência (commit, snapshot,
-   semente, cenário e versões), manifesto e SHA-256. Verificar tamanho,
-   checksum e presença dos objetos; só marcar o run como final após conferir.
-3. Implementar um supervisor externo à máquina e ao runner do GitHub,
-   responsável pelo prazo, por encerrar alocação de GPU no sucesso ou falha e
-   por reconciliar execuções órfãs. Guardar logs parciais diante de falha,
-   tentar upload por intervalo limitado e encerrar mesmo se o S3 ficar
-   indisponível; nunca manter a GPU ligada indefinidamente.
-4. Validar em um smoke no servidor, incluindo falha simulada de upload e
-   confirmação das duas fases: arquivo verificado no S3 e alocação encerrada
-   no provedor. Não promover resultados de testes locais a produção.
+Quando live-run.json indicar verified_local e completed=true, no executor
+isolado do uploader:
+
+    python -m infra.runpod.n20.r2_verified_pilot prepare --durable-root "$TCC_N20_DURABLE_ROOT" --run-id "$N20_RUN_ID"
+
+A preparacao sem rede cria e valida r2-pilot.zip. O unico objeto permitido
+e tcc/piloto/n20-<run-id>.zip no bucket privado tcc. A lista fechada contem
+manifesto final, CSVs, eventos, ledgers e metadados BF16. Nao inclui banco
+SQLite/WAL, config do host, logs, texto do modelo ou chaves. O arquivo
+r2-pilot.local.json (ignorado pelo Git) pode guardar somente endpoint,
+bucket=tcc, region=auto, prefix=tcc/piloto; nenhuma chave. O assinador
+externo cria duas concessoes privadas SigV4 de curta duracao para exatamente
+esse objeto. O PUT deve assinar If-None-Match:* (e, se assinar Content-Type,
+application/zip). Injete apenas no uploader, de forma nao interativa e
+sem imprimir, TCC_N20_R2_PUT_URL e TCC_N20_R2_GET_URL. Nao passe em
+argumentos, nao habilite set -x, nao grave no shell/state e nao use link
+publico. Execute:
+
+    python -m infra.runpod.n20.r2_verified_pilot upload --durable-root "$TCC_N20_DURABLE_ROOT" --run-id "$N20_RUN_ID"
+
+O uploader faz um PUT condicional (nunca sobrescreve), um GET independente
+com ate tres tentativas limitadas e confere tamanho, SHA-256, membros do ZIP
+e todas as evidencias reabertas. Em PUT incerto, tenta so GET, nunca redespacha
+um PUT nesse processo. Depois escreve r2-downloaded.zip separado e o recibo
+atomico e saneado r2-verified.json. A mesma copia e mesmo recibo sao aceitos
+localmente sem repetir envio. Falha preserva evidencia e nao publica recibo.
+Use um limite externo tambem para o uploader; o watchdog nao prolonga o
+prazo da GPU por causa de demora de rede ou armazenamento.
+
+O teste offline usa dados artificiais e adapter de desligamento falso. Para
+habilitar servidor real faltam: volume/ACLs medidos, assinador para esse escopo,
+adapter autenticado do provedor preso ao ID exato, agendamento independente,
+prazo nativo do provedor quando disponivel, circuito de alerta se a parada
+nao for confirmada, smoke no provedor e autorizacao do Allan. Nao assumir
+que a GPU foi desligada apenas porque o cliente pediu a parada. Somente
+resultados reais, aprovados e recuperados com hash verificado contam como
+producao. O uploader ainda aceita apenas o piloto 20x5, nao os 17 cenarios
+da campanha.

@@ -15,7 +15,11 @@ on:
         description: "Scenario to run (used only for live execution)"
         type: choice
         default: pilot
-        options: [pilot, C01, C16, C17, C10, C14, C11, C02, C03, C08, C04, C05, C09, C06, C07, C12, C15, C13]
+        options: [pilot]
+      run_id:
+        description: "Controller-assigned 32-character lowercase hex run ID (required for live)"
+        type: string
+        required: false
       acknowledge_live:
         description: "Authorize this workflow to consume existing runner time (no provisioning)"
         type: boolean
@@ -42,7 +46,7 @@ jobs:
         run: |
           python -m infra.runpod.n20.benchmark preflight
           python -m unittest sistema.tests.test_dedicated_inference sistema.tests.test_dedicated_orchestrator sistema.tests.test_runner_per_node
-          python -m unittest infra.runpod.n20.test_benchmark
+          python -m unittest infra.runpod.n20.test_benchmark infra.runpod.n20.test_r2_verified_pilot infra.runpod.n20.test_watchdog
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.11.4"
@@ -68,15 +72,23 @@ jobs:
       TCC_LIVE_N20_APPROVED: "true"
       NVIDIA_MODEL_SNAPSHOT: '${{ vars.TCC_LIVE_N20_SNAPSHOT }}'
       TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB: '${{ vars.TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB }}'
+      TCC_N20_DURABLE_ROOT: '${{ vars.TCC_N20_DURABLE_ROOT }}'
+      N20_RUN_ID: '${{ inputs.run_id }}'
+      TCC_N20_CONTROLLER_STATE: '${{ vars.TCC_N20_CONTROLLER_STATE }}'
+      TCC_N20_RESOURCE_ID: '${{ vars.TCC_N20_RESOURCE_ID }}'
       SCENARIO: '${{ inputs.scenario }}'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Run and verify 100 pilot or 1000 official generations
+      - name: Run and verify 100 pilot generations
         working-directory: n20-runtime
         run: |
           test -n "$NVIDIA_MODEL_SNAPSHOT"
           test -n "$TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB"
+          test -d "$TCC_N20_DURABLE_ROOT"
+          test -n "$N20_RUN_ID"
           python -m infra.runpod.n20.benchmark run --scenario "$SCENARIO" --seed 0 \
-            --snapshot "$NVIDIA_MODEL_SNAPSHOT" --output "$RUNNER_TEMP/tcc-n20-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            --snapshot "$NVIDIA_MODEL_SNAPSHOT" --durable-root "$TCC_N20_DURABLE_ROOT" \
+            --run-id "$N20_RUN_ID" \
+            --controller-state "$TCC_N20_CONTROLLER_STATE" --resource-id "$TCC_N20_RESOURCE_ID"

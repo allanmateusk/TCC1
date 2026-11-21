@@ -140,13 +140,24 @@ def _verify_campaign(work, config, entry):
             raise RuntimeError(f"Missing genesis records in {node} ledger")
 
 
+# Only explicit runtime variables enter inference and coordinator processes.
+_CHILD_KEYS = frozenset({
+    "PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONUTF8", "PYTHONDONTWRITEBYTECODE",
+    "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP", "TMPDIR",
+    "APPDATA", "LOCALAPPDATA", "LD_LIBRARY_PATH", "CUDA_HOME", "LANG", "LC_ALL",
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+})
+
+
+def child_environment(parent):
+    return {key: value for key, value in parent.items() if key.upper() in _CHILD_KEYS}
+
+
 def execute_scenario(work, entry, configuration, snapshot, devices, check, progress):
     specifications, config = scenario_configuration(configuration, entry, work, snapshot)
     config_path = work / "config.yaml"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    # The bucket credential is only for the supervisor.
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith("TCC_S3_") and key != "RUNPOD_API_KEY"}
+    env = child_environment(os.environ)
     children = []
     ready = {}
     with ExitStack() as stack:
