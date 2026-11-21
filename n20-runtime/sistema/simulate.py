@@ -136,7 +136,13 @@ def run_simulation(args: argparse.Namespace, *, round_observer=None) -> dict:
     unstable_rng = random.Random(f"{args.seed}:unstable")
     if unstable_mode == "attribute":
         marked = round(float(args.unstable) * len(node_ids))
-        unstable_nodes = set(unstable_rng.sample(node_ids, marked)) if marked else set()
+        override = getattr(args, "unstable_node_ids_override", None)
+        if override is None:
+            unstable_nodes = set(unstable_rng.sample(node_ids, marked)) if marked else set()
+        else:
+            unstable_nodes = set(override)
+            if len(unstable_nodes) != marked or not unstable_nodes.issubset(profiles):
+                raise ValueError("Explicit unstable node IDs must match the configured attribute count.")
     else:
         unstable_nodes = set()
 

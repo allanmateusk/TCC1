@@ -239,3 +239,20 @@ confirmada, smoke no provedor e autorizacao. As antigas flags RunPod
 que a GPU foi desligada apenas porque o cliente pediu a parada. Somente
 resultados reais, aprovados e recuperados com hash verificado contam como
 producao. O CI valida o roteiro HTTP de 50 rodadas no C13 com substituto, sem inferencia BF16 nem chamada real ao R2.
+
+## Pilotos sinteticos locais (separados da campanha)
+
+O [Terraform local Docker](local-docker/README.md) e seus testes empacotam
+so o simulador e o subconjunto de questoes, sem volumes, portas ou rede no
+conteiner. A fase oficial continua no runner separado. Os modulos r2_pilot,
+r2_docker_pilot e r2_m80_pilot existem apenas para pequenas provas sinteticas
+privadas, nao para a campanha. Use --prepare-only nos empacotadores para
+verificar sem rede; os arquivos sinteticos devem estar em
+resultados/docker-local/<id> e ficam fora do Git.
+
+Somente quando um upload sintetico estiver autorizado, mantenha o endpoint
+real em r2-pilot.local.json nao rastreado. O arquivo r2-pilot.example.json
+contem apenas um placeholder. O helper r2_pilot_prompt usa terminal
+interativo e entrada sem eco, nao guarda credenciais e nao gera link publico.
+Nenhum desses comandos e executado contra R2 pelo CI. Nunca passe chaves ou
+URLs assinadas em argumentos, no Git, no estado Terraform ou nos logs.

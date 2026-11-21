@@ -47,6 +47,7 @@ jobs:
           python -m infra.runpod.n20.benchmark preflight
           python -m unittest sistema.tests.test_dedicated_inference sistema.tests.test_dedicated_orchestrator sistema.tests.test_runner_per_node
           python -m unittest infra.runpod.n20.test_benchmark infra.runpod.n20.test_r2_verified_pilot infra.runpod.n20.test_watchdog
+          python -m unittest infra.runpod.n20.test_local_pilots infra.runpod.n20.test_r2_pilot infra.runpod.n20.test_r2_pilot_prompt
       - name: Exercise C13 50-round HTTP protocol using stand-in inference
         working-directory: n20-runtime
         run: python -m infra.runpod.n20.integration_smoke run --scenario C13 --output "$RUNNER_TEMP/tcc-n20-offline-c13"
