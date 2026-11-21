@@ -23,7 +23,7 @@ TRUST_KEYS={"batch_id","resource_id","owner_id","datacenter_id","pod_name","git_
             "snapshot_revision","workflow_id","workflow_version","worker_version","cloudflare_account_id",
             "opened_at","stop_at","hard_deadline","durable_root","snapshot","peak_vram_mib","service_uid"}
 SIGNED=set(TRUST_KEYS)-{"durable_root","snapshot","service_uid"} | {
-    "schema","run_id","scenario_id","workflow_instance_id","observed_at","expires_at","status","cloud",
+    "schema","run_id","scenario_id","workflow_instance_id","armed_at_ms","observed_at","expires_at","status","cloud",
     "provider_phase","stop_enabled","sleep"}
 LOCAL_ENV={"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"}
 GIT="/usr/bin/git"
@@ -59,7 +59,7 @@ def _iso(t):
 def verify_evidence(e,t,*,now,profile):
     # Caller must first authenticate signature with protected root-owned anchor.
     if (type(e) is not dict or type(t) is not dict or set(t)!=TRUST_KEYS or set(e)!=SIGNED
-        or e["schema"]!="tcc-incremental-first-case-trusted-observation/v1" or e["scenario_id"]!=CASE):
+        or e["schema"]!="tcc-incremental-first-case-trusted-observation/v2" or e["scenario_id"]!=CASE):
         raise ValueError("No trusted first-case observation")
     needed=set(TRUST_KEYS)-{"durable_root","snapshot","service_uid"}
     if any(type(t[k]) is not type(e[k]) or e[k]!=t[k] for k in needed):
@@ -79,14 +79,17 @@ def verify_evidence(e,t,*,now,profile):
         campaign_profiles.digest(profile),profile["model_revision"]
     ):
         raise ValueError("Profile or snapshot does not match local fixed release")
-    if any(type(e[x]) is not int for x in ("opened_at","stop_at","hard_deadline","observed_at","expires_at",
-                                          "peak_vram_mib")):
+    if any(type(e[x]) is not int for x in ("opened_at","stop_at","hard_deadline","armed_at_ms",
+                                          "observed_at","expires_at","peak_vram_mib")):
         raise ValueError("Observation timing and capacity must use exact integers")
-    if (not (e["opened_at"]>0 and 4*3600<=e["stop_at"]-e["opened_at"] and
-             e["hard_deadline"]-e["opened_at"]<=7*3600 and e["hard_deadline"]-e["stop_at"]==300) or
-        not (e["opened_at"]<=e["observed_at"]<=now<e["expires_at"]<=e["observed_at"]+60)
-        or now-e["opened_at"]>300 or e["stop_at"]-now<300 or not 5900<=e["peak_vram_mib"]<=200000):
-        raise ValueError("Expired observation, late admission or inadequate model capacity")
+    opened_ms=e["opened_at"]*1000
+    if (not (e["opened_at"]>0 and 4*3600<=e["hard_deadline"]-e["opened_at"]<=7*3600
+             and e["hard_deadline"]-e["stop_at"]==300)
+        or not (opened_ms<=e["armed_at_ms"]<=opened_ms+300_000
+                and e["armed_at_ms"]<=e["observed_at"]*1000)
+        or not (e["observed_at"]<=now<e["expires_at"]<=e["observed_at"]+60)
+        or e["stop_at"]-now<300 or not 5900<=e["peak_vram_mib"]<=200000):
+        raise ValueError("Late first arm, expired observation, insufficient cutoff margin or inadequate capacity")
     if (e["cloud"],e["provider_phase"],e["stop_enabled"])!=("SECURE","RUNNING",True) or e["stop_enabled"] is not True:
         raise ValueError("Exact RunPod state not independently confirmed")
     if e["status"] not in ("running","waiting") or type(e["sleep"]) is not dict or e["sleep"] != {

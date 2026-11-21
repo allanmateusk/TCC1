@@ -33,26 +33,35 @@ export function pin(raw,payload,instance) {
     throw Error("DISARMED_OR_WRONG_BATCH");
   if (raw.terminalPubKey!==null) rawB64(raw.terminalPubKey,32);
   const start=utc(raw.startedAt), wake=utc(raw.stopAt), end=utc(raw.deadline);
-  if (end-start<4*HOUR || end-start>7*HOUR || end-wake<120000 || end-wake>600000)
+  if (end-start<4*HOUR || end-start>7*HOUR || end-wake!==300000)
     throw Error("UNAPPROVED_BATCH_WINDOW");
   return Object.freeze({...Object.fromEntries(keys.map(k=>[k,raw[k]])),start,wake,end});
 }
 export function planId(plan) { return JSON.stringify(keys.map(k=>plan[k])); }
 export function armTime(plan,now) {
-  if (!(plan.start<=now && now<plan.wake && now-plan.start<=300000)) throw Error("ARM_WITHIN_FIVE_MINUTES");
+  if (!validArm(plan,now)) throw Error("ARM_WITHIN_FIVE_MINUTES");
 }
-export async function armState(store,plan) {
+export async function armState(store,plan,now) {
   return store.transaction(async txn=>{
+    armTime(plan,now());
     const id=planId(plan), prior=await txn.get("batch-plan");
-    if (prior!==undefined && prior!==id) return false;
-    if (prior===undefined) await txn.put("batch-plan",id);
-    return true;
+    const original=await txn.get("first-armed-at-ms");
+    if (prior!==undefined) return prior===id && validArm(plan,original)?original:false;
+    if (original!==undefined) return false;
+    const at=now();
+    armTime(plan,at);
+    await txn.put("batch-plan",id);
+    await txn.put("first-armed-at-ms",at);
+    armTime(plan,now());
+    return at;
   });
 }
+const validArm=(p,t)=>Number.isSafeInteger(t) && p.start<=t && t<=p.start+300000 && t<p.wake;
 export async function claimState(store,plan,kind,now) {
   if (!eligible(plan,kind,now)) return false;
   return store.transaction(async txn=>{
-    if (await txn.get("batch-plan")!==planId(plan) || await txn.get("stop-claimed")!==undefined) return false;
+    if (await txn.get("batch-plan")!==planId(plan) || !validArm(plan,await txn.get("first-armed-at-ms")) ||
+        await txn.get("stop-claimed")!==undefined) return false;
     await txn.put("stop-claimed",{batch:plan.batch,kind,at:now});
     return true;
   });
@@ -114,8 +123,9 @@ export async function runCutoffWorkflow(plan,step,{now,arm,perform}) {
   const noRetry={retries:{limit:0,delay:"1 second"},timeout:"45 seconds"};
   await step.do("bind-exact-batch",noRetry,async()=>{
     armTime(plan,now());
-    if (!await arm()) throw Error("UNVERIFIED_OR_REUSED_POD_BINDING");
-    return {batch:plan.batch,pod:plan.pod,stopAt:plan.stopAt,deadline:plan.deadline,
+    const armedAtMs=await arm();
+    if (!validArm(plan,armedAtMs) || armedAtMs>now()) throw Error("UNVERIFIED_OR_REUSED_POD_BINDING");
+    return {batch:plan.batch,pod:plan.pod,armedAtMs,stopAt:plan.stopAt,deadline:plan.deadline,
             gitSha:plan.gitSha,profileSha256:plan.profileSha256};
   });
   await step.sleepUntil("absolute-batch-cutoff",new Date(plan.wake));

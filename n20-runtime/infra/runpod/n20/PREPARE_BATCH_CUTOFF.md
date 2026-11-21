@@ -17,7 +17,7 @@ O arquivo de entrada tem exatamente duas chaves de nível superior:
   `stale_seconds`, `hourly_compute_microusd`, `fixed_and_other_microusd`,
   `approved_cap_microusd`. Use v4 UUID sem hífens, nome
   `tcc-n20-batch-<uuid-sem-hífens>`, instantes Unix UTC em segundos inteiros,
-  `stop_at-opened_at >= 4 h`, `hard_deadline-opened_at <= 7 h`, e
+  `4 h <= hard_deadline-opened_at <= 7 h`, e
   `hard_deadline-stop_at = 300 s`. Declare somente preço/cap acordados.
 - `operator_observation`: mesmos `batch_id`, `resource_id`, `owner_id`,
   `datacenter_id` e `pod_name`, mais `status: "RUNNING"`, `cloud: "SECURE"`,

@@ -21,9 +21,9 @@ def fixture():
         worker_version="f721260c-fedf-4fda-ad01-5544d2c49de5",cloudflare_account_id="a"*32,
         durable_root="/workspace/results",snapshot="/workspace/snapshot",peak_vram_mib=6200,service_uid=12345)
     e={k:t[k] for k in set(t)-{"durable_root","snapshot","service_uid"}}
-    e.update(schema="tcc-incremental-first-case-trusted-observation/v1",scenario_id=live.CASE,
+    e.update(schema="tcc-incremental-first-case-trusted-observation/v2",scenario_id=live.CASE,
              run_id="82e2415e840a4aacb77e712bd08670ca",workflow_instance_id="f721260c-fedf-4fda-ad01-5544d2c49de2",
-             observed_at=NOW-5,expires_at=NOW+30,status="running",cloud="SECURE",provider_phase="RUNNING",
+             armed_at_ms=(NOW-95)*1000+117,observed_at=NOW-5,expires_at=NOW+30,status="running",cloud="SECURE",provider_phase="RUNNING",
              stop_enabled=True,sleep=dict(name="absolute-batch-cutoff-1",type="sleep",finished=False,
                                         end=live._iso(t["stop_at"]),error=None))
     return t,e,profile
@@ -35,6 +35,31 @@ class FirstAdmissionTest(unittest.TestCase):
         self.assertEqual(live.verify_evidence(e,t,now=NOW,profile=profile),e)
         e["status"]="waiting"
         self.assertEqual(live.verify_evidence(e,t,now=NOW,profile=profile),e)
+
+    def test_late_launch_needs_early_durable_arm_with_fresh_exact_wait(self):
+        t,e,profile=fixture()
+        t.update(opened_at=NOW-900,stop_at=NOW-900+4*3600-300,hard_deadline=NOW-900+4*3600)
+        e.update(opened_at=t["opened_at"],stop_at=t["stop_at"],hard_deadline=t["hard_deadline"],
+                 armed_at_ms=(t["opened_at"]+300)*1000)
+        e["sleep"]["end"]=live._iso(t["stop_at"])
+        self.assertEqual(live.verify_evidence(e,t,now=NOW,profile=profile),e)
+        for bad in (e["armed_at_ms"]+1,t["opened_at"]*1000-1,True):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):
+                live.verify_evidence({**e,"armed_at_ms":bad},t,now=NOW,profile=profile)
+        del e["armed_at_ms"]
+        with self.assertRaises(ValueError):
+            live.verify_evidence(e,t,now=NOW,profile=profile)
+
+    def test_reject_near_stop_and_hard_deadline_below_exact_four_hours(self):
+        for open_at,stop_at,hard_at in (
+                (NOW-4*3600+599,NOW+299,NOW+599),
+                (NOW-4*3600+1201,NOW+900,NOW+1200)):
+            t,e,profile=fixture()
+            t.update(opened_at=open_at,stop_at=stop_at,hard_deadline=hard_at)
+            e.update(opened_at=open_at,stop_at=stop_at,hard_deadline=hard_at,armed_at_ms=open_at*1000)
+            e["sleep"]["end"]=live._iso(stop_at)
+            with self.subTest(remaining=stop_at-NOW,duration=hard_at-open_at),self.assertRaises(ValueError):
+                live.verify_evidence(e,t,now=NOW,profile=profile)
 
     def test_any_binding_change_is_denied(self):
         for field,value in (("owner_id","someone"),("resource_id","other"),("git_sha","0"*40),

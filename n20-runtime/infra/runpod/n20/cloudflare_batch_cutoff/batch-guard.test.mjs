@@ -56,6 +56,10 @@ test("exact scope and 4–7h, UTC, wake margin, startup bounds are enforced",()=
   assert.throws(()=>pin(over,over,over.batch),/WINDOW/);
   const tooSoon={...raw,stopAt:at(3*3600000-300000),deadline:at(3*3600000)};
   assert.throws(()=>pin(tooSoon,tooSoon,tooSoon.batch),/WINDOW/);
+  const exact4h={...raw,deadline:at(4*3600000),stopAt:at(4*3600000-300000)};
+  assert.doesNotThrow(()=>pin(exact4h,exact4h,exact4h.batch));
+  assert.throws(()=>pin({...exact4h,stopAt:at(4*3600000-299999)},
+    {...exact4h,stopAt:at(4*3600000-299999)},exact4h.batch),/WINDOW/);
   const bad={...raw,stopAt:raw.deadline};
   assert.throws(()=>pin(bad,bad,bad.batch),/WINDOW/);
   assert.throws(()=>armTime(plan,ms+300001),/FIVE/);
@@ -64,16 +68,18 @@ test("exact scope and 4–7h, UTC, wake margin, startup bounds are enforced",()=
 });
 test("same owner plus Pod cannot be silently rebased to a different batch or pinned code",async()=>{
   const storage=new Storage();
-  assert.equal(await armState(storage,plan),true);
-  assert.equal(await armState(storage,plan),true);
+  assert.equal(await armState(storage,plan,()=>ms+1),ms+1);
+  assert.equal(await armState(storage,plan,()=>ms+2000),ms+1);
+  assert.equal(storage.map.get("first-armed-at-ms"),ms+1);
+  await assert.rejects(armState(storage,plan,()=>ms+300001),/FIVE/);
   const different={...raw,batch:"82e2415e-840a-4aac-b77e-712bd08670ca"};
-  assert.equal(await armState(storage,pin(different,different,different.batch)),false);
+  assert.equal(await armState(storage,pin(different,different,different.batch),()=>ms),false);
   assert.equal(await claimState(storage,pin(different,different,different.batch),"cutoff",plan.wake),false);
 });
 test("terminal and deadline can race; shared durable claim allows one STOP total",async()=>{
   const storage=new Storage(), f=standin();
   assert.equal(await claimState(storage,plan,"terminal",plan.wake),false);
-  await armState(storage,plan);
+  await armState(storage,plan,()=>ms);
   const [a,b]=await Promise.all(["terminal","cutoff"].map(kind=>stopExact(plan,kind,opts(plan,f,storage,kind,plan.wake))));
   assert.equal(writes(f),1);
   assert.equal(a.state,"STOP_CONFIRMED"); assert.equal(b.state,"STOP_CONFIRMED");
@@ -82,7 +88,7 @@ test("terminal and deadline can race; shared durable claim allows one STOP total
 });
 test("lost claim can only reconcile, and lost POST gets an independent EXITED read",async()=>{
   const storage=new Storage(), f=standin({postMode:"lost"}), g=standin();
-  await armState(storage,plan);
+  await armState(storage,plan,()=>ms);
   const lostClaim={...opts(plan,g,storage,"cutoff",plan.wake),claim:async()=>{
     await claimState(storage,plan,"cutoff",plan.wake);
     throw Error("Lost claim ACK");
@@ -90,20 +96,20 @@ test("lost claim can only reconcile, and lost POST gets an independent EXITED re
   assert.equal((await stopExact(plan,"cutoff",lostClaim)).reason,"CLAIM_NOT_GRANTED_GET_ONLY");
   assert.equal(writes(g),0);
   const other=new Storage();
-  await armState(other,plan);
+  await armState(other,plan,()=>ms);
   assert.equal((await stopExact(plan,"cutoff",opts(plan,f,other,"cutoff",plan.wake))).state,"STOP_CONFIRMED");
   assert.equal(writes(f),1); assert.equal(f.calls.at(-1)[1],"GET");
 });
 test("202 with RUNNING still is not a verified stop; cannot POST twice",async()=>{
   const storage=new Storage(), f=standin({postMode:"stuck"});
-  await armState(storage,plan);
+  await armState(storage,plan,()=>ms);
   assert.equal((await stopExact(plan,"cutoff",opts(plan,f,storage,"cutoff",plan.wake))).reason,"STOP_NOT_CONFIRMED");
   assert.equal((await stopExact(plan,"cutoff",opts(plan,f,storage,"cutoff",plan.wake))).reason,"CLAIM_NOT_GRANTED_GET_ONLY");
   assert.equal(writes(f),1);
 });
 test("wrong owner, Pod, datacenter or cloud; early wake and missed window are nonmutating",async()=>{
   const storage=new Storage();
-  await armState(storage,plan);
+  await armState(storage,plan,()=>ms);
   for (const f of [standin({owner:"other"}),standin({override:{id:"other"}}),
       standin({override:{dataCenterId:"other"}}),standin({override:{cloud:"COMMUNITY"}})]) {
     assert.equal((await stopExact(plan,"cutoff",opts(plan,f,storage,"cutoff",plan.wake))).state,"MANUAL_REQUIRED");
@@ -153,11 +159,13 @@ test("workflow helper persists exact approval before sleeping at absolute UTC, t
   let t=plan.start+1000;
   const order=[];
   const worker={do:async(name,config,fn)=>{
-    order.push(name); assert.equal(config.retries.limit,0); return fn();
+    order.push(name); assert.equal(config.retries.limit,0); const result=await fn();
+    if(name==="bind-exact-batch") assert.equal(result.armedAtMs,plan.start+500);
+    return result;
   }, sleepUntil:async(name,time)=>{
     order.push(name); assert.equal(time.toISOString(),raw.stopAt); t=time.getTime();
   }};
-  assert.equal(await runCutoffWorkflow(plan,worker,{now:()=>t,arm:async()=>true,perform:async()=>{
+  assert.equal(await runCutoffWorkflow(plan,worker,{now:()=>t,arm:async()=>plan.start+500,perform:async()=>{
     assert.equal(t,plan.wake); return "done";
   }}),"done");
   assert.deepEqual(order,["bind-exact-batch","absolute-batch-cutoff","cutoff-stop-or-reconcile"]);

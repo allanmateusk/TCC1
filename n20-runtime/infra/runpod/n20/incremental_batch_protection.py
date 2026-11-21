@@ -44,8 +44,7 @@ class BatchProtection:
                    self.fixed_and_other_microusd, self.approved_cap_microusd)
         if any(type(value) is not int or not 0 <= value <= 10**12 for value in numeric):
             raise ValueError("Use finite nonnegative integers for timestamps and micro-USD")
-        if not (self.opened_at > 0 and 4*3600 <= self.stop_at-self.opened_at
-                and self.hard_deadline-self.opened_at <= 7*3600
+        if not (self.opened_at > 0 and 4*3600 <= self.hard_deadline-self.opened_at <= 7*3600
                 and 60 <= self.hard_deadline-self.stop_at <= 600):
             raise ValueError("Absolute 4–7 h protection and 60–600 s reconciliation reserve required")
         if not (self.hourly_compute_microusd > 0 and self.approved_cap_microusd > 0

@@ -1,5 +1,5 @@
 import { WorkflowEntrypoint, DurableObject } from "cloudflare:workers";
-import { armState, armTime, binding, claimState, pin, provider, runCutoffWorkflow, stopExact, verifyTerminal } from "./batch-guard.mjs";
+import { armState, binding, claimState, pin, provider, runCutoffWorkflow, stopExact, verifyTerminal } from "./batch-guard.mjs";
 
 // Candidate is not armed and has no route. Do not fill from event data.
 const APPROVED=null;
@@ -14,8 +14,7 @@ function bounded(task) {
 export class BatchStopBarrier extends DurableObject {
   async arm(raw) {
     const plan=pin(APPROVED,raw,raw?.batch);
-    armTime(plan,Date.now());
-    return armState(this.ctx.storage,plan);
+    return armState(this.ctx.storage,plan,Date.now);
   }
   async claim(raw,kind,proof,signature) {
     const plan=pin(APPROVED,raw,raw?.batch);

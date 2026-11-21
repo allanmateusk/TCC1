@@ -43,7 +43,8 @@ class ProtectionTests(unittest.TestCase):
         self.assertEqual(self.spec.cost_ceiling_microusd, expected_ceiling)
         replace(self.spec, approved_cap_microusd=expected_ceiling)
         for change in (
-            {"approved_cap_microusd":expected_ceiling-1}, {"stop_at":self.start+4*3600-1},
+            {"approved_cap_microusd":expected_ceiling-1},
+            {"stop_at":self.start+4*3600-301,"hard_deadline":self.start+4*3600-1},
             {"hard_deadline":self.start+7*3600+1, "stop_at":self.start+7*3600-90},
             {"hard_deadline":self.spec.stop_at+59}, {"hard_deadline":self.spec.stop_at+601},
             {"hourly_compute_microusd":True}, {"opened_at":float(self.start)}, {"owner_id":""},
@@ -51,6 +52,7 @@ class ProtectionTests(unittest.TestCase):
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 BatchProtection(**{**self.args, **change})
+        replace(self.spec, stop_at=self.start+4*3600-300, hard_deadline=self.start+4*3600)
         replace(self.spec, stop_at=self.start+7*3600-91, hard_deadline=self.start+7*3600,
                 approved_cap_microusd=30_000_000)
         with self.assertRaises(TypeError):

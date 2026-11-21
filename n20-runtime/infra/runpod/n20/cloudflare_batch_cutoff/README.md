@@ -3,8 +3,8 @@
 Separate offline candidate for the 20-case campaign, not the pilot. No
 deployment, credentials, public route, workers.dev, preview, cron or generic
 HTTP relay. The hard UTC deadline is 4–7 hours after independently verified
-start. STOP is scheduled 2–10 minutes earlier; use **5 minutes** as the shared
-operational reserve, rather than the smaller local-authorizer minimum.
+start. STOP is scheduled exactly **5 minutes** earlier, so the 4-hour
+minimum schedules STOP at 3 h 55 min.
 
 Run `node --test batch-guard.test.mjs` in this directory. An already installed
 Wrangler can compile with `deploy --dry-run --config wrangler.jsonc --outdir <scratch>`
@@ -17,10 +17,13 @@ secret or provider test.
   cannot arm by itself. The Workflow instance ID is the exact hyphenated v4
   batch UUID; the controller ID is the same hex without separators. Timestamps
   are canonical UTC with millisecond precision.
-- The cutoff persists its plan within five minutes of start, then sleeps in
-  `absolute-batch-cutoff`. The dedicated SQLite Durable Object is keyed by
-  exact owner plus Pod. It refuses rebinding to another batch/plan; no reset
-  or rearm path is provided.
+- The cutoff persists its plan and original `armedAtMs` within five minutes
+  of start, exposes that same timestamp in the completed `bind-exact-batch`
+  step result, then sleeps in `absolute-batch-cutoff`. The dedicated SQLite
+  Durable Object is keyed by exact owner plus Pod and cannot rebase that time.
+  The trusted observer must authenticate the original arm time and match the
+  exact still-pending sleep when producing the version 2 launch receipt;
+  launching later does not waive fresh observation or cutoff margin.
 - Optional early completion requires independently verified receipts for all
   20 scenarios and a signed, fresh Ed25519 claim. Leave `terminalPubKey: null`
   until a separate trusted receipt collector, signer and private trigger path
