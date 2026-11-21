@@ -85,6 +85,12 @@ def pod_put_once(scope, data, config, put_url, journal_dir, *, authorize, opener
     """Create-only PUT from the Pod. A persisted attempt always reconciles by GET."""
     transport_deadline = _preflight(scope,config,put_url,"PUT",authorize,now=now)
     scope.valid_bytes(data)
+    return _wire_put_once(scope,data,put_url,journal_dir,content_type="application/zip",
+                          opener=opener,deadline=transport_deadline)
+
+
+def _wire_put_once(scope,data,put_url,journal_dir,*,content_type,opener,deadline):
+    # Call only after purpose-specific scope and payload authorization.
     journal_dir = Path(journal_dir)
     if (not journal_dir.is_absolute() or journal_dir.resolve(strict=True) != journal_dir
             or not journal_dir.is_dir()):
@@ -103,8 +109,8 @@ def pod_put_once(scope, data, config, put_url, journal_dir, *, authorize, opener
         return "already_attempted_get_only"
     try:
         request = Request(put_url,data=data,method="PUT",
-                          headers={"Content-Type":"application/zip","If-None-Match":"*"})
-        _request(opener,request,transport_deadline,time.monotonic,size=scope.size)
+                          headers={"Content-Type":content_type,"If-None-Match":"*"})
+        _request(opener,request,deadline,time.monotonic,size=scope.size)
     except (Transient,ExistingObject):
         return "ambiguous_get_only"
     return "put_ack_not_verified"
@@ -113,17 +119,20 @@ def pod_put_once(scope, data, config, put_url, journal_dir, *, authorize, opener
 def verify_get(scope, config, get_url, *, authorize, opener, now=None):
     """Use only the reader grant and independently assigned digest, not the Pod ACK."""
     transport_deadline = _preflight(scope,config,get_url,"GET",authorize,now=now)
+    data=_wire_get(get_url,scope.size,opener=opener,deadline=transport_deadline)
+    scope.valid_bytes(data)
+    return {"schema":RECEIPT,"status":"verified",**scope.proof_fields(),
+            "nodes":20,"rounds":50,"verified_own_generations":1000}
+
+
+def _wire_get(get_url,size,*,opener,deadline):
+    # Purpose-specific validators must recheck bytes after this bounded read.
     request = Request(get_url,method="GET")
     for delay in (0,.25,.75):
         if delay:
             time.sleep(delay)
         try:
-            data = _request(opener,request,transport_deadline,time.monotonic,size=scope.size)
-            break
+            return _request(opener,request,deadline,time.monotonic,size=size)
         except Transient:
             continue
-    else:
-        raise TransferError("Independent R2 download not verified")
-    scope.valid_bytes(data)
-    return {"schema":RECEIPT,"status":"verified",**scope.proof_fields(),
-            "nodes":20,"rounds":50,"verified_own_generations":1000}
+    raise TransferError("Independent R2 download not verified")
