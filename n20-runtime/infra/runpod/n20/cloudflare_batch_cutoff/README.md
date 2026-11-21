@@ -58,3 +58,20 @@ and provider shutdown were not exercised.
 References: [Cloudflare sleepUntil](https://developers.cloudflare.com/workflows/build/sleeping-and-retrying/),
 [Cloudflare Workflow limits](https://developers.cloudflare.com/workflows/reference/limits/),
 [RunPod Pod management](https://docs.runpod.io/pods/manage-pods).
+
+
+## Fim do lote sob supervisão
+
+Com `terminalPubKey: null`, concluir o lote não desliga o Pod automaticamente.
+Assim que os 20 resultados tiverem GET independente e verificação de integridade,
+o operador autorizado usa **Stop**, não **Terminate**, e confirma que o Pod exato
+ficou `EXITED`. O cutoff absoluto previamente armado fica como proteção caso a
+parada manual não aconteça. Não armar outro emissor automático de STOP.
+
+Para automatizar a parada antecipada, ainda é necessário ligar um coletor
+independente dos 20 recibos a um assinante Ed25519 protegido e a um disparo
+privado do Workflow terminal. Não fixe a chave de teste nem habilite o terminal
+com base na declaração do Pod. A prova local `node --test terminal-workflow.test.mjs`
+usa o Workflow e a barreira reais com adaptadores em memória: comprova a
+sequência assinatura, claim persistido, POST único e GET `EXITED` simulado;
+não é validação de desligamento no provedor nem do assinante operacional.
