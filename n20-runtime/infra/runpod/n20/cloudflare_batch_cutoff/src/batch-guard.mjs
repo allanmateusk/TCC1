@@ -119,13 +119,16 @@ export function binding(stub,plan) { return stub.getByName(plan.owner+":"+plan.p
 export function provider(fetcher,token){return transport(fetcher,token);}
 
 
-export async function runCutoffWorkflow(plan,step,{now,arm,perform}) {
+export async function runCutoffWorkflow(plan,step,{now,arm,perform,workerVersion}) {
   const noRetry={retries:{limit:0,delay:"1 second"},timeout:"45 seconds"};
   await step.do("bind-exact-batch",noRetry,async()=>{
     armTime(plan,now());
+    if (typeof workerVersion!=="string" ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(workerVersion))
+      throw Error("UNVERIFIED_RUNTIME_VERSION");
     const armedAtMs=await arm();
     if (!validArm(plan,armedAtMs) || armedAtMs>now()) throw Error("UNVERIFIED_OR_REUSED_POD_BINDING");
-    return {batch:plan.batch,pod:plan.pod,armedAtMs,stopAt:plan.stopAt,deadline:plan.deadline,
+    return {batch:plan.batch,pod:plan.pod,armedAtMs,workerVersion,stopAt:plan.stopAt,deadline:plan.deadline,
             gitSha:plan.gitSha,profileSha256:plan.profileSha256};
   });
   await step.sleepUntil("absolute-batch-cutoff",new Date(plan.wake));

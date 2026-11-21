@@ -35,7 +35,7 @@ export class RunPodBatchCutoff extends WorkflowEntrypoint {
     const raw=event.payload;
     const plan=pin(APPROVED,raw,event.instanceId);
     if (!this.env.RUNPOD_BATCH_STOP_TOKEN) throw Error("UNARMED_MISSING_SECRET");
-    return runCutoffWorkflow(plan,step,{now:Date.now,
+    return runCutoffWorkflow(plan,step,{now:Date.now,workerVersion:this.env.CF_VERSION_METADATA?.id,
       arm:()=>bounded(binding(this.env.BATCH_STOP_BARRIER,plan).arm(raw)),
       perform:()=>perform(this.env,raw,plan,"cutoff")});
   }

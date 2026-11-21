@@ -9,6 +9,7 @@ const raw={batch:"f721260c-fedf-4fda-ad01-5544d2c49de2",owner:"test-owner",pod:"
   datacenter:"TEST-1",name:"Known test Pod",startedAt:at(0),stopAt:at(17_700_000),deadline:at(18_000_000),
   gitSha:"2".repeat(40),profileSha256:"3".repeat(64),terminalPubKey:null};
 const plan=pin(raw,raw,raw.batch);
+const workerVersion="8212983a-45b7-4557-af35-1778ab832fb8";
 class Storage {
   map=new Map();
   queue=Promise.resolve();
@@ -42,6 +43,7 @@ test("default source is disarmed; config has no HTTP, previews, cron or legacy r
   assert.match(source,/const APPROVED=null;/);
   assert.match(source,/runCutoffWorkflow\(plan,step/);
   assert.equal(config.workers_dev,false);
+  assert.deepEqual(config.version_metadata,{binding:"CF_VERSION_METADATA"});
   assert.equal(config.preview_urls,false);
   assert.deepEqual(config.routes,[]);
   assert.equal(config.triggers,undefined);
@@ -160,18 +162,26 @@ test("workflow helper persists exact approval before sleeping at absolute UTC, t
   const order=[];
   const worker={do:async(name,config,fn)=>{
     order.push(name); assert.equal(config.retries.limit,0); const result=await fn();
-    if(name==="bind-exact-batch") assert.equal(result.armedAtMs,plan.start+500);
+    if(name==="bind-exact-batch") {
+      assert.equal(result.armedAtMs,plan.start+500);
+      assert.equal(result.workerVersion,workerVersion);
+    }
     return result;
   }, sleepUntil:async(name,time)=>{
     order.push(name); assert.equal(time.toISOString(),raw.stopAt); t=time.getTime();
   }};
-  assert.equal(await runCutoffWorkflow(plan,worker,{now:()=>t,arm:async()=>plan.start+500,perform:async()=>{
+  assert.equal(await runCutoffWorkflow(plan,worker,{now:()=>t,workerVersion,arm:async()=>plan.start+500,perform:async()=>{
     assert.equal(t,plan.wake); return "done";
   }}),"done");
   assert.deepEqual(order,["bind-exact-batch","absolute-batch-cutoff","cutoff-stop-or-reconcile"]);
 });
+test("missing runtime Worker metadata refuses before arming",async()=>{
+  const worker={do:async(_name,_cfg,fn)=>fn(),sleepUntil:()=>assert.fail("must not sleep")};
+  await assert.rejects(runCutoffWorkflow(plan,worker,{now:()=>plan.start,
+    arm:()=>assert.fail("must not arm"),perform:()=>assert.fail("must not contact provider")}),/RUNTIME_VERSION/);
+});
 test("workflow refuses missing/reused claim before reaching sleep or provider",async()=>{
   const worker={do:async(_name,_cfg,fn)=>fn(), sleepUntil:()=>assert.fail("must not sleep")};
-  await assert.rejects(runCutoffWorkflow(plan,worker,{now:()=>plan.start,arm:async()=>false,
+  await assert.rejects(runCutoffWorkflow(plan,worker,{now:()=>plan.start,workerVersion,arm:async()=>false,
     perform:()=>assert.fail("provider must not be called")}),/UNVERIFIED_OR_REUSED/);
 });
