@@ -17,7 +17,10 @@ output "n20_preflight" {
     model                             = local.profile.model
     model_revision                    = local.profile.model_revision
     quantization                      = local.profile.quantization
+    dtype                             = local.profile.dtype
     thinking                          = local.profile.thinking
+    pilot_rounds                      = local.profile.pilot_rounds
+    pilot_expected_generations        = [for rounds in local.profile.pilot_rounds : local.profile.nodes * rounds]
     scenario_seed_pairs               = length(local.profile.scenarios) * length(local.profile.seeds)
     generations_per_scenario_and_seed = local.profile.nodes * local.profile.rounds
   }
@@ -30,13 +33,19 @@ output "n20_preflight" {
       local.profile.models_per_gpu == 10 &&
       local.profile.nodes == local.profile.gpu_count * local.profile.models_per_gpu &&
       local.profile.inference_layout == "per_node" &&
-      local.profile.quantization == "nf4" &&
+      local.profile.quantization == "none" &&
+      local.profile.dtype == "bfloat16" &&
+      jsonencode(local.profile.pilot_rounds) == "[5]" &&
       local.profile.model == "HuggingFaceTB/SmolLM3-3B" &&
       local.profile.model_type == "smollm3" &&
       local.profile.thinking == false &&
-      length(local.profile.scenarios) == 6 &&
-      length(local.profile.seeds) == 5
+      length(local.profile.scenarios) == 17 &&
+      jsonencode(local.profile.seeds) == "[0]" &&
+      local.profile.pilot.id == "pilot" &&
+      local.profile.pilot.malicious_nodes == 0 &&
+      local.profile.scenarios[0].id == "C01" &&
+      local.profile.scenarios[16].id == "C13"
     )
-    error_message = "Expected 20 dedicated models on two GPUs, 50 rounds and 30 scenario/seed combinations."
+    error_message = "Expected 20 dedicated unquantized BF16 models on two GPUs, one five-round pilot, and 17 fifty-round scenarios with one shared seed."
   }
 }

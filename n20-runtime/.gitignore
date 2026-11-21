@@ -5,3 +5,5 @@ __pycache__/
 .env
 sistema/results/
 resultados/
+r2-pilot.local.json
+README-r2-local.md

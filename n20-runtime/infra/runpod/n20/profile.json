@@ -1,14 +1,14 @@
 {
-  "schema": "tcc-live-n20/v1",
+  "schema": "tcc-live-n20/v2",
   "nodes": 20,
   "rounds": 50,
   "gpu_count": 2,
-  "gpu_target": "Linux CUDA; capacity pending SmolLM3-3B measurement",
+  "gpu_target": "Linux CUDA BF16; capacity pending concurrent measurement",
   "models_per_gpu": 10,
   "inference_layout": "per_node",
   "model": "HuggingFaceTB/SmolLM3-3B",
   "model_revision": "a07cc9a04f16550a088caea529712d1d335b0ac1",
-  "quantization": "nf4",
+  "quantization": "none",
   "max_new_tokens": 256,
   "temperature": 0.7,
   "top_p": 0.95,
@@ -24,53 +24,139 @@
     "mechanism": "ema_slow_up",
     "defense": "all",
     "audit_mode": "random",
-    "audit_p": 0.2,
     "score": "exact",
     "honest_rounds": 5,
-    "malicious_strategy": "knows_schedule",
+    "malicious_strategy": "on_off",
     "collusion_value": 999,
-    "relative_noise_distance": 0.2
+    "relative_noise_distance": 0.2,
+    "test_every": 10
   },
   "seeds": [
-    0,
-    1,
-    2,
-    3,
-    4
+    0
   ],
   "scenarios": [
     {
-      "id": "baseline",
+      "id": "C01",
       "malicious_nodes": 0,
-      "noise_mode": "relative"
+      "audit": "none",
+      "audit_p": 0
     },
     {
-      "id": "m20-alto",
+      "id": "C16",
       "malicious_nodes": 4,
-      "noise_mode": "multiplicative"
+      "audit": "none",
+      "audit_p": 0
     },
     {
-      "id": "m40-alto",
+      "id": "C17",
       "malicious_nodes": 8,
-      "noise_mode": "multiplicative"
+      "audit": "none",
+      "audit_p": 0
     },
     {
-      "id": "m80-alto",
+      "id": "C10",
+      "malicious_nodes": 12,
+      "audit": "none",
+      "audit_p": 0
+    },
+    {
+      "id": "C14",
       "malicious_nodes": 16,
-      "noise_mode": "multiplicative"
+      "audit": "none",
+      "audit_p": 0
     },
     {
-      "id": "m40-sutil",
+      "id": "C11",
+      "malicious_nodes": 12,
+      "audit": "fixed",
+      "audit_p": 0.2,
+      "match_audit_count": "C08"
+    },
+    {
+      "id": "C02",
       "malicious_nodes": 8,
-      "noise_mode": "relative"
+      "audit": "random",
+      "audit_p": 0.1
     },
     {
-      "id": "m80-sutil",
+      "id": "C03",
+      "malicious_nodes": 8,
+      "audit": "random",
+      "audit_p": 0.2
+    },
+    {
+      "id": "C08",
+      "malicious_nodes": 12,
+      "audit": "random",
+      "audit_p": 0.2
+    },
+    {
+      "id": "C04",
       "malicious_nodes": 16,
-      "noise_mode": "relative"
+      "audit": "random",
+      "audit_p": 0.1
+    },
+    {
+      "id": "C05",
+      "malicious_nodes": 16,
+      "audit": "random",
+      "audit_p": 0.2
+    },
+    {
+      "id": "C09",
+      "malicious_nodes": 12,
+      "audit": "random",
+      "audit_p": 0.2,
+      "genesis_rounds": 3
+    },
+    {
+      "id": "C06",
+      "malicious_nodes": 16,
+      "audit": "random",
+      "audit_p": 0.2,
+      "genesis_rounds": 3
+    },
+    {
+      "id": "C07",
+      "malicious_nodes": 16,
+      "audit": "random",
+      "audit_p": 0.2,
+      "score": "graded"
+    },
+    {
+      "id": "C12",
+      "malicious_nodes": 12,
+      "audit": "random",
+      "audit_p": 0.2,
+      "mechanism": "ema"
+    },
+    {
+      "id": "C15",
+      "malicious_nodes": 16,
+      "audit": "random",
+      "audit_p": 0.2,
+      "mechanism": "ema"
+    },
+    {
+      "id": "C13",
+      "malicious_nodes": 16,
+      "audit": "random",
+      "audit_p": 0.2,
+      "genesis_rounds": 3,
+      "dropout_colluder_p": 0.3
     }
   ],
   "model_type": "smollm3",
   "thinking": false,
-  "vram_headroom": 1.2
+  "vram_headroom": 1.2,
+  "dtype": "bfloat16",
+  "pilot_rounds": [
+    5
+  ],
+  "pilot": {
+    "id": "pilot",
+    "malicious_nodes": 0,
+    "audit": "random",
+    "audit_p": 0.2
+  }
 }

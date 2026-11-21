@@ -41,6 +41,7 @@ class ModelBackend:
         device: Optional[str] = None,
         max_new_tokens: int = 256,
         quantization: Optional[str] = None,
+        dtype: Optional[str] = None,
     ) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig  # import tardio
         import torch
@@ -55,17 +56,38 @@ class ModelBackend:
             self.device = "mps"
         else:
             self.device = "cpu"
-        dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if dtype == "bfloat16":
+            if self.device != "cuda" or not torch.cuda.is_bf16_supported(including_emulation=False):
+                raise ValueError("Native CUDA BF16 is required; no precision fallback.")
+            if quantization is not None:
+                raise ValueError("This BF16 model must be loaded without quantization.")
+            torch_dtype = torch.bfloat16
+        elif dtype in (None, "float16"):
+            torch_dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype!r}")
+        if dtype == "bfloat16":
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if quantization == "nf4":
             if self.device != "cuda":
                 raise ValueError("A quantização NF4 requer CUDA neste modo.")
             config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype=dtype, quantization_config=config, device_map={"": 0})
+                model_name, torch_dtype=torch_dtype, quantization_config=config, device_map={"": 0})
         elif quantization is None:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(self.device)
+            if dtype == "bfloat16":
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch_dtype, device_map={"": 0}, local_files_only=True)
+                if (self.model.dtype != torch_dtype or self.model.device.type != "cuda"
+                        or getattr(self.model, "is_quantized", False)
+                        or getattr(self.model.config, "quantization_config", None) is not None):
+                    raise RuntimeError("Unexpected loaded Smol precision or device; refusing fallback.")
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch_dtype).to(self.device)
         else:
             raise ValueError(f"Quantização desconhecida: {quantization!r}")
 

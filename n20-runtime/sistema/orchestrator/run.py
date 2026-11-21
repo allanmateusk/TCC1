@@ -13,11 +13,16 @@ import yaml
 
 from ..core import dataset as dataset_module
 from ..core.answer import normalize
+from dataclasses import replace
+from ..core.distance import choose_weighted
 from ..core.defenses import preset as defense_preset, with_overrides
 from ..core.ledger import RoundRecord
 from ..core.metrics import MetricsLogger, dynamic_summary
 from ..core.network import GroupRound, log_round
-from ..core.protocol import Decision, ProtocolConfig, Vote, oracle_record, oracle_round, plan_audits
+from ..core.protocol import (
+    Decision, ProtocolConfig, Vote, calibration_record, leaderless_calibration_round,
+    oracle_record, oracle_round, plan_audits,
+)
 from ..core.reputation import ReputationTracker
 from ..core.schedule import DEFAULT_TEST_EVERY, is_test_round, test_rounds_1based
 from ..core.schemas import NodeResponse
@@ -97,6 +102,8 @@ def _protocol_config(config: dict) -> ProtocolConfig:
     audit_mode = config.get("audit_mode", "fixed")
     audited = plan_audits(int(config.get("seed", 0)), int(config.get("rounds", 20)),
                           int(config.get("test_every", DEFAULT_TEST_EVERY)), float(config.get("audit_p", 0.1))) if audit_mode == "random" else frozenset()
+    if "audit_rounds_override" in config:
+        audited = frozenset(config["audit_rounds_override"])
     return ProtocolConfig(
         signal=config.get("signal", "hybrid"),
         alpha=float(config.get("alpha", 0.3)),
@@ -113,7 +120,8 @@ def _protocol_config(config: dict) -> ProtocolConfig:
         audited_rounds=audited,
         alpha_up=float(config.get("alpha_up", 0.1)),
         defense=with_overrides(
-            defense_preset(config.get("defense", "all")),
+            replace(defense_preset(config.get("defense", "all")),
+                    leaderless_calibration=bool(config.get("leaderless_calibration"))),
             calibration_rounds=config.get("calibration_rounds"),
             consensus_alpha=config.get("consensus_alpha"),
             oracle_alpha=config.get("oracle_alpha"),
@@ -158,6 +166,7 @@ async def run_dynamic_experiment(config: dict) -> dict:
     graph = build_graph(node_ids, config.get("topology", "kregular"), degree=int(config.get("degree", 4)), seed=int(config.get("seed", 0)))
 
     logger = MetricsLogger(output_dir, experiment_id=config.get("experiment_id"), overwrite=True)
+    campaign = config.get("campaign_plan")
     gid_of: dict[str, int] = {n: 0 for n in node_ids}
     next_gid = 1
     states: dict[str, dict] = {}
@@ -182,7 +191,22 @@ async def run_dynamic_experiment(config: dict) -> dict:
                 groups = _groups_by_head(states)
                 reference_head = max(groups, key=lambda h: (honest_count(groups[h]), len(groups[h])))
                 outcomes: list[GroupRound] = []
-                for head, members in groups.items():
+                genesis = leaderless_calibration_round(round_index, cfg)
+                event = {"round": round_index + 1,
+                         "planned": oracle_round(round_index, cfg),
+                         "preempted": bool(campaign and round_index + 1 in campaign["preempted_rounds"]),
+                         "genesis": genesis, "oracle_by_node": {}, "simulated_absences": []}
+                if genesis:
+                    if len(groups) != 1:
+                        raise RuntimeError("Genesis requires a single common chain")
+                    payload = {"round_index": round_index, "task_id": task["id"], "question": task["question"],
+                               "head": reference_head}
+                    if mode == "simulation":
+                        payload["expected"] = task["answer"]
+                    spread = await _post(client, f"{urls[groups[reference_head][0]]}/task", payload, timeout)
+                    if not spread or set(spread["responses"]) != set(node_ids):
+                        raise RuntimeError("Genesis task did not reach every node")
+                for head, members in ([] if genesis else groups.items()):
                     outcome = await _lead_group(
                         client, urls, members, head, round_index, task, mode, timeout,
                         gid=gid_of[members[0]], is_reference=head == reference_head,
@@ -200,13 +224,48 @@ async def run_dynamic_experiment(config: dict) -> dict:
                 answers = dict(zip(node_ids, await asyncio.gather(
                     *(_get(client, f"{urls[n]}/answer", timeout, round_index=round_index) for n in node_ids)
                 )))
+                if campaign:
+                    intentional = {n for n, item in answers.items() if item and item.get("intentional_absence")}
+                    intended = set(campaign["simulated_absences"].get(round_index+1, ()))
+                    if intentional != intended or any(answers[n].get("answer") is not None for n in intentional):
+                        raise RuntimeError(f"Submission absence differs from the plan on round {round_index+1}")
+                    event["simulated_absences"] = sorted(intentional, key=node_sort_key)
                 if strict_inference:
                     missing = [n for n in node_ids if not (answers[n] or {}).get("received")]
-                    if missing or not outcomes:
+                    if missing or (not outcomes and not genesis):
                         raise RuntimeError(f"Rodada incompleta: nós sem resposta registrada: {missing}; grupos: {len(outcomes)}")
-                if oracle_round(round_index, cfg):
-                    await _judge(client, urls, await read_states(client), answers, outcomes, round_index, task["id"], expected, cfg, timeout,
-                                 require_applied=strict_inference)
+                if genesis:
+                    values = {n: normalize((answers[n] or {}).get("answer")) for n in node_ids}
+                    result = choose_weighted(list(values.items()), before, cfg.consensus_mode, cfg.consensus_center)
+                    record = calibration_record(prev_hash=reference_head, round_index=round_index, task_id=task["id"],
+                                                expected=expected, responses=values, consensus=result.answer)
+                    returned = await asyncio.gather(*(
+                        _post(client, f"{urls[n]}/oracle", {"record": record.to_json()}, timeout) for n in node_ids))
+                    event["oracle_by_node"] = {
+                        n: ("applied" if item and item.get("status") == "applied" and item.get("head")==record.hash
+                            else (item or {}).get("status", "unreachable"))
+                        for n, item in zip(node_ids, returned, strict=True)}
+                    if any(not item or item.get("status") != "applied" or item.get("head") != record.hash
+                           for item in returned):
+                        event["complete"] = False
+                        if campaign:
+                            _audit_event(output_dir, event)
+                        raise RuntimeError("Genesis record was not applied on every node with the same hash")
+                    outcomes.append(GroupRound(
+                        gid=gid_of[node_ids[0]], is_reference=True, members=node_ids, leader=None, auditor=None,
+                        bootstrap=False, attack=None, record=record, decision=None, votes={}, hops=spread["depth"],
+                        refusers=[], fork_gid=None, malicious_power_mass=0.0, margin=result.margin,
+                        is_tie=result.is_tie, oracle="calibration", committed={n: result.answer for n in node_ids}))
+                elif oracle_round(round_index, cfg):
+                    oracle_status = await _judge(client, urls, await read_states(client), answers, outcomes,
+                                                 round_index, task["id"], expected, cfg, timeout)
+                    event["oracle_by_node"] = oracle_status
+                    if strict_inference and (set(oracle_status) != set(node_ids) or
+                                             any(v != "applied" for v in oracle_status.values())):
+                        event["complete"] = False
+                        if campaign:
+                            _audit_event(output_dir, event)
+                        raise RuntimeError(f"Ground truth was not applied to all nodes: {oracle_status}")
 
                 states = await read_states(client)
                 after = {n: s["consensus"].get(n, cfg.initial) for n, s in states.items()}
@@ -229,8 +288,11 @@ async def run_dynamic_experiment(config: dict) -> dict:
                     mechanism=cfg.mechanism, initial=cfg.initial, is_test=this_is_test,
                     consensus_mode=cfg.consensus_mode, consensus_center=cfg.consensus_center,
                     audited=oracle_round(round_index, cfg),
-                    calibration=cfg.signal != "consensus" and round_index < cfg.defense.calibration_rounds,
+                    calibration=genesis if campaign else cfg.signal != "consensus" and round_index < cfg.defense.calibration_rounds,
                 )
+                if campaign:
+                    event["complete"] = True
+                    _audit_event(output_dir, event)
                 _print_dynamic_round(round_index, outcomes, this_is_test)
 
             ledgers = await asyncio.gather(*(_get(client, f"{urls[n]}/ledger", timeout) for n in node_ids))
@@ -331,6 +393,14 @@ async def _lead_group(
     )
 
 
+def _audit_event(output_dir, event):
+    """Completed lines follow all per-node, round and leadership writes."""
+    with open(os.path.join(output_dir, "audit-events.jsonl"), "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 async def _judge(
     client: httpx.AsyncClient,
     urls: dict[str, str],
@@ -342,10 +412,9 @@ async def _judge(
     expected,
     cfg: ProtocolConfig,
     timeout: float,
-    *,
-    require_applied: bool = False,
-) -> None:
+    ) -> dict[str, str]:
     """Entrega o gabarito a cada cópia da cadeia (votado ou direto)."""
+    all_status = {}
     for head, members in _groups_by_head(states).items():
         graded = {m: normalize((answers.get(m) or {}).get("answer")) for m in members}
         record = oracle_record(prev_hash=head, round_index=round_index, task_id=task_id, expected=expected, graded=graded)
@@ -356,13 +425,14 @@ async def _judge(
         statuses = await asyncio.gather(
             *(_post(client, f"{urls[m]}/oracle", {"record": record.to_json(), "votes": votes}, timeout) for m in members)
         )
-        if require_applied and any(not item or item.get("status") != "applied" for item in statuses):
-            raise RuntimeError(f"Conferência não aplicada em todos os nós: {statuses}")
+        all_status.update({n: (s or {}).get("status", "unreachable")
+                           for n, s in zip(members, statuses, strict=True)})
         status = next((s["status"] for s in statuses if s), "")
         for outcome in outcomes:
             if outcome.leader in members:
                 outcome.oracle = status
                 outcome.oracle_rejecters = sum(1 for ok in (votes or {}).values() if not ok)
+    return all_status
 
 
 def _print_dynamic_round(round_index: int, outcomes: list[GroupRound], is_test: bool) -> None:

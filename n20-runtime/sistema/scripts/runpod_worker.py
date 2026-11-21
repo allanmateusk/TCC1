@@ -29,6 +29,7 @@ def scenario_configuration(c, entry, work, snapshot):
         "dataset": "task_bank", "task-bank": ROOT / c["task_bank"], "mode": "real",
         "inference-mode": "model", "model": c["model"], "model-run-id": entry["id"],
         "model-snapshot": snapshot, "model-revision": c["model_revision"],
+        "model-quantization": c["quantization"], "model-dtype": c["dtype"],
         "gpu-count": c["gpu_count"], "models-per-gpu": c["models_per_gpu"],
         "topology": c["topology"], "signal": c["signal"], "consensus-mode": c["consensus_mode"],
         "consensus-center": c["consensus_center"], "mechanism": c["mechanism"], "defense": c["defense"],
@@ -41,6 +42,12 @@ def scenario_configuration(c, entry, work, snapshot):
     services, config = build_configuration(parse_args([
         part for key, value in values.items() for part in (f"--{key}", str(value))
     ]))
+    plan = entry.get("audit_plan")
+    if plan is not None:
+        config["campaign_plan"] = plan
+        config["audit_rounds_override"] = [r - 1 for r in plan["planned_rounds"]]
+        config["leaderless_calibration"] = bool(plan["genesis_rounds"])
+        config["calibration_rounds"] = len(plan["genesis_rounds"])
     processes = {}
     for node in config["nodes"]:
         node_id = node["id"]
@@ -50,6 +57,12 @@ def scenario_configuration(c, entry, work, snapshot):
                    MODEL_NAME=str(snapshot), MODEL_CACHE_DIR=str(work / "node-models" / node_id),
                    MODEL_MAX_NEW_TOKENS=str(c["max_new_tokens"]),
                    MODEL_TEMPERATURE=str(c["temperature"]), MODEL_TOP_P=str(c["top_p"]))
+        if plan is not None:
+            env.update(AUDIT_ROUNDS_OVERRIDE=json.dumps(config["audit_rounds_override"]),
+                       LEADERLESS_CALIBRATION="1" if config["leaderless_calibration"] else "0",
+                       CALIBRATION_ROUNDS=str(config["calibration_rounds"]),
+                       N20_SIMULATED_ABSENCES=json.dumps(sorted(
+                           int(r)-1 for r, absent in plan["simulated_absences"].items() if node_id in absent)))
         gpu = int(service["deploy"]["resources"]["reservations"]["devices"][0]["device_ids"][0])
         processes[node_id] = (gpu, env)
     return processes, config
@@ -70,6 +83,61 @@ def stop_processes(processes):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def _completed_campaign_rounds(work):
+    path = work / "audit-events.jsonl"
+    complete = []
+    if path.exists():
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.endswith("\n"):
+                    break  # a concurrent reader caught the writer on its last line
+                row = json.loads(line)
+                if not row["complete"]:
+                    break
+                if row["round"] != len(complete)+1:
+                    raise RuntimeError("Non-contiguous verified round telemetry")
+                complete.append(row)
+    return complete
+
+
+def _verify_campaign(work, config, entry):
+    from collections import Counter
+    planned = entry["audit_plan"]
+    nodes = {node["id"] for node in config["nodes"]}
+    completed = _completed_campaign_rounds(work)
+    if len(completed) != entry["rounds"]:
+        raise RuntimeError("Campaign evidence does not cover every round")
+    for row in completed:
+        r = row["round"]
+        if (
+            row["genesis"] != (r in planned["genesis_rounds"])
+            or row["planned"] != (r in planned["planned_rounds"])
+            or row["preempted"] != (r in planned["preempted_rounds"])
+            or set(row["simulated_absences"]) != set(planned["simulated_absences"].get(r, ()))
+            or set(row["oracle_by_node"]) != (nodes if row["planned"] or row["genesis"] else set())
+            or any(status != "applied" for status in row["oracle_by_node"].values())
+        ):
+            raise RuntimeError(f"Campaign evidence deviates from round {r} plan")
+    with (work / "leadership.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    reference = [int(row["round_index"])+1 for row in rows if row["is_reference"] == "1"]
+    if reference != list(range(1, entry["rounds"]+1)):
+        raise RuntimeError("Unexpected reference leadership coverage")
+    for row in rows:
+        if int(row["round_index"])+1 in planned["genesis_rounds"] and (
+            row["outcome"] != "calibration" or row["leader"] or row["auditor"]
+        ):
+            raise RuntimeError("Genesis has unexpected election or quorum")
+    with (work / "reputation_history.csv").open(encoding="utf-8", newline="") as stream:
+        history = Counter((int(row["checkpoint"]),row["node_id"]) for row in csv.DictReader(stream))
+    if history != Counter((r,n) for r in range(entry["rounds"]+1) for n in nodes):
+        raise RuntimeError("Unexpected reputation checkpoint coverage")
+    for node in nodes:
+        snap = json.loads((work / "ledgers" / f"{node}.json").read_text(encoding="utf-8"))
+        if not snap["valid"] or [r["round_index"]+1 for r in snap["records"] if r["kind"]=="calibration"] != planned["genesis_rounds"]:
+            raise RuntimeError(f"Missing genesis records in {node} ledger")
 
 
 def execute_scenario(work, entry, configuration, snapshot, devices, check, progress):
@@ -106,14 +174,16 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                         try:
                             with urlopen(URLS[node_id] + "/health", timeout=2) as response:
                                 health = json.load(response)
-                            if (health.get("node_id"), health.get("model_instances"),
-                                    health.get("quantization")) == (node_id, 1, "nf4"):
+                            if (health.get("node_id"), health.get("model_loaded"), health.get("model_instances"),
+                                    health.get("quantization"), health.get("dtype")) == (
+                                        node_id, True, 1, configuration["quantization"], configuration["dtype"]
+                                    ):
                                 break
                         except (OSError, ValueError):
                             pass
                         time.sleep(0.5)
                     else:
-                        raise TimeoutError(f"{node_id} não carregou o modelo NF4 em cinco minutos.")
+                        raise TimeoutError(f"{node_id} não carregou o modelo na precisão exigida em cinco minutos.")
                 progress("loading", nodes_ready=len(ready))
             log = stack.enter_context((work / "orchestrator.log").open("wb"))
             coordinator = subprocess.Popen(
@@ -127,7 +197,9 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                     raise RuntimeError("Um nó encerrou antes da conclusão do cenário.")
                 rounds = work / "rounds.csv"
                 count = 0
-                if rounds.exists():
+                if "audit_plan" in entry:
+                    count = len(_completed_campaign_rounds(work))
+                elif rounds.exists():
                     with rounds.open(encoding="utf-8", newline="") as stream:
                         count = sum(row.get("round_index", "").isdigit() for row in csv.DictReader(stream))
                 fields = {"rounds_completed": count}
@@ -140,4 +212,7 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
         finally:
             stop_processes(children)
     _verify_per_node(work, work / "node-models", configuration["nodes"], entry["rounds"], entry["id"],
-                     configuration["model_revision"], model_path=str(snapshot))
+                     configuration["model_revision"], model_path=str(snapshot),
+                     quantization=configuration["quantization"], dtype=configuration["dtype"])
+    if "audit_plan" in entry:
+        _verify_campaign(work, config, entry)

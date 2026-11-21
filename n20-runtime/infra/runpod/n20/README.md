@@ -5,34 +5,70 @@ executor e faz um **plano local, sem provider nem recursos remotos**: apenas con
 a topologia, o modelo e o volume de trabalho. Não cria máquina nem altera a
 campanha preexistente. Não é um plano de compra/provisionamento.
 
-## Grade e inferência
+## Grade oficial: 17 cenarios e um piloto separado
 
-| Cenário | Nós em conluio | Transformação |
-| --- | ---: | --- |
-| baseline | 0/20 | nenhuma |
-| m20-alto | 4/20 | ruído multiplicativo forte |
-| m40-alto | 8/20 | ruído multiplicativo forte |
-| m80-alto | 16/20 | ruído multiplicativo forte |
-| m40-sutil | 8/20 | distância relativa 0,2 |
-| m80-sutil | 16/20 | distância relativa 0,2 |
+Execute os cenarios na ordem registrada em profile.json. Todos usam seed 0,
+20 nos, 50 rodadas e as mesmas questoes, em igual ordem. O piloto tem 20 nos
+honestos e 5 rodadas, com p=0,2 e sem genese. Sao 17.000 geracoes oficiais,
+mais 100 do piloto. Um disparo executa um cenario; nao ha disparo automatico
+em lote, cobranca, provisionamento ou envio automatico de resultados.
 
-Cada cenário usa 50 questões fixas do GSM8K e cinco sementes (0–4), um cenário e
-uma semente por disparo, 1.000 gerações novas por execução. São 30 combinações
-(30.000 gerações se toda a grade for solicitada separadamente). A auditoria
-aleatória usa p=0,2 (probabilidade, não número fixo de auditorias); cinco rodadas
-de teste ocorrem a cada 10 rodadas. A nota é exata, a topologia é 4-regular, com
-medoide, orquestração dinâmica e EMA assimétrico (`ema_slow_up`).
-Os nós em conluio se comportam como honestos nas cinco primeiras rodadas.
-Com `knows_schedule` e auditoria aleatória, eles não veem quais rodadas foram auditadas.
+| Ordem | ID | Conluio | Auditoria | Mudanca adicional |
+| ---: | --- | ---: | --- | --- |
+| 1 | C01 | 0% | nenhuma | controle |
+| 2 | C16 | 20% | nenhuma | |
+| 3 | C17 | 40% | nenhuma | |
+| 4 | C10 | 60% | nenhuma | |
+| 5 | C14 | 80% | nenhuma | |
+| 6 | C11 | 60% | fixa | mesmo numero planejado de C08 |
+| 7 | C02 | 40% | p=0,1 | |
+| 8 | C03 | 40% | p=0,2 | |
+| 9 | C08 | 60% | p=0,2 | |
+| 10 | C04 | 80% | p=0,1 | |
+| 11 | C05 | 80% | p=0,2 | |
+| 12 | C09 | 60% | p=0,2 | genese 1-3 |
+| 13 | C06 | 80% | p=0,2 | genese 1-3 |
+| 14 | C07 | 80% | p=0,2 | nota gradual |
+| 15 | C12 | 60% | p=0,2 | EMA simetrico |
+| 16 | C15 | 80% | p=0,2 | EMA simetrico |
+| 17 | C13 | 80% | p=0,2 | genese 1-3 e omissao sintetica pela coorte de 16 |
 
-O ruído forte já implementado no simulador é `s × (|b|+1) × 10^k`, com sinal
-compartilhado `s∈{-1,+1}` e `k∈[3,6]`. Ele é aplicado à geração do mesmo nó
-de referência do conluio: coordena a **resposta enviada**, sem pular a geração
-local dos participantes. O controle sutil usa distância relativa 0,2 em
-relação à base não nula. Não confundir estes dados sintéticos de consenso
-com tráfego real.
+Padrao: topologia 4-regular, orquestracao dinamica, medoide, nota exata e
+EMA assimetrico (ema_slow_up). Nas primeiras cinco rodadas os conluiados
+nao perturbam suas respostas. A partir da sexta, todos os conluiados usam
+o valor-base do mesmo membro, enquanto cada no ainda gera seu proprio valor
+na GPU. A transformacao multiplicativa oficial usa
+s * (abs(base)+1) * 10^k, sinal compartilhado e k uniforme em [3,6].
 
-Cada nó tem próprio processo, endpoint local, geração, semente, instância **SmolLM3-3B NF4** e cópia residente em CUDA. Os processos compartilham só o snapshot
+Os testes fixos nas rodadas 10/20/30/40/50 sao de avaliacao, nao aplicam
+gabarito ao protocolo. Para auditoria aleatoria, cada rodada recebe o mesmo
+U em todos os cenarios, pela seed 0, mesmo se for inelegivel. Os testes e a
+genese sao excluidos, sem deslocar o sorteio das demais rodadas. Assim,
+p=0,1 e subconjunto de p=0,2, e habilitar a genese nao rerrola a agenda.
+C11 espalha deterministicamente nas rodadas elegiveis tantos pontos fixos
+quanto os sorteados em C08. O atacante nao adapta sua conduta a agenda em
+C11: o comparativo altera apenas a agenda. Para listar um plano sem rodar,
+use python -m infra.runpod.n20.benchmark plan [--scenario C13].
+
+Genese significa que as rodadas 1 a 3 dispensam eleicao, proposta e voto.
+Cada no gera sua resposta, um registro de calibracao com gabarito e
+gravado em cada replica e o coordenador confirma o mesmo hash nas 20.
+A auditoria aleatoria e uma correcao externa por gabarito, distinta do
+auditor eleito e do quorum da proposta. O perfil all mantem bypass do
+quorum da correcao; um bloqueio nao e esperado nessa configuracao.
+audit-events.jsonl registra por rodada o planejado/preemptado, genese,
+aplicado/bloqueado/stale/inalcancavel por no, e omissoes intencionais.
+O evento completo e emitido depois de gravar todas as metricas da rodada.
+
+Em C13, cada um de node-0..node-15 tem probabilidade 0,30 de omitir
+a resposta submetida em cada rodada, inclusive na genese, em agenda
+independente e reproduzivel. Reproduz a mesma regra de coorte do piloto
+local (nao a mesma sequencia antiga de pares no/rodada). Mesmo o no com
+omissao gera a resposta crua na GPU, ainda vota no protocolo e pode
+fornecer sua base crua ao conluio. Falha de rede/processo e saida sem
+numero nao sao classificadas como omissao programada.
+
+Cada nó tem próprio processo, endpoint local, geração, semente, instância **SmolLM3-3B BF16 sem quantização** e cópia residente em CUDA. Os processos compartilham só o snapshot
 fixado em disco, não um serviço central de inferência. São dez instâncias por GPU
 em duas GPUs como topologia de referência. Não herda uma estimativa de VRAM do
 Qwen. Antes de habilitar, meça num próximo teste controlado no próprio servidor
@@ -40,7 +76,11 @@ o pico por processo (incluindo alocação CUDA total, prompt representativo e
 geração no limite), informe-o em GiB e confirme capacidade com o smoke concorrente.
 O pré-requisito de VRAM livre é esse pico medido × 10 processos × 1,2 de folga por
 GPU. A capacidade e o tempo dos 20 processos juntos ainda precisam ser medidos.
-O checkpoint oficial é fixado em `profile.json`; usa o chat template do SmolLM3
+O checkpoint oficial é fixado em `profile.json`. O carregador exige suporte
+nativo à BF16, verifica o dtype real e a ausência de quantização, e aborta em vez
+de substituir por FP16, NF4 ou CPU. Os pesos somam 5,73 GiB por processo antes
+da memória de execução; o preflight não certifica a capacidade da máquina.
+O modelo usa o chat template do SmolLM3
 com `/no_think`, sem alterar o prompt usado pelo Qwen legado.
 
 O arquivo de entrada `gsm8k_test_n20.json` contém exclusivamente as mesmas
@@ -49,10 +89,10 @@ com diretório obrigatório novo e sem registros de inferência. O SQLite por n�
 registra as novas gerações e deduplica somente a mesma solicitação em caso de
 repetição técnica ou da consulta pelo nó em conluio; não há replay entre
 cenários/rodadas/execuções, nem fallback para banco. A validação exige uma
-geração nova única em cada nó × rodada (1.000/1.000), as 50 rodadas completas e
+geração nova única em cada nó × rodada, as rodadas declaradas completas e
 coerência das respostas finais com as métricas. A configuração reaproveita o
 worker e o `/health` da Lara (commit `58f1f998f707ea484ab83370802c663baea18d82`),
-verificando identidade, uma instância ativa e NF4 antes da coordenação.
+verificando identidade, uma instância ativa e BF16 sem quantização antes da coordenação.
 As chamadas têm limite configurado de 600 s no protocolo; a carga de cada nó
 tem limite de 5 min. O processo supervisor termina os nós ao concluir/falhar.
 
@@ -76,8 +116,8 @@ e restrição da branch no ambiente GitHub. Instale as dependências de execuç�
 inclusive PyTorch CUDA e as de `sistema/node/requirements-dedicated.txt`, no runner
 existente, configure `TCC_LIVE_N20_SNAPSHOT` com o snapshot local fixado pelo
 perfil e deixe os endpoints 18100–18119 livres. Configure também
-`TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB` com o maior pico medido no runner. O workflow guarda artefatos
-inclusive em falhas, tenta interromper com limite interno de 110 minutos e
+`TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB` com o maior pico medido no runner. O workflow deixa os artefatos no runner, sem envio automatico. Tenta
+interromper com limite interno de 110 minutos e
 aplica limite do job de 120 minutos. Não usa segredos de alocação nem comandos
 `terraform apply`.
 
@@ -88,8 +128,8 @@ runner com o mesmo perfil:
 
 ```sh
 TCC_LIVE_N20_APPROVED=true TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB="$PICO_MEDIDO_GIB" python -m infra.runpod.n20.benchmark run \
-  --scenario m80-alto --seed 0 --snapshot "$TCC_LIVE_N20_SNAPSHOT" \
-  --output /caminho/novo/live-n20-m80-alto-s0
+  --scenario C05 --seed 0 --snapshot "$TCC_LIVE_N20_SNAPSHOT" \
+  --output /caminho/novo/live-n20-C05-s0
 ```
 
 O workflow antigo do projeto de origem não foi copiado. Para
@@ -98,25 +138,39 @@ este executor e projetar seu próprio perfil de Controller/RunPod, verificação
 de capacidade, custo, prazo, upload e encerramento automático. Nenhum GPU
 ou serviço pago foi ativado por esta configuração.
 
+## Primeiro piloto: 20 nos honestos por 5 rodadas
+
+Execute uma combinacao por vez. Com capacidade validada e autorizacao do
+runner ja existente:
+
+\`\`\`sh
+TCC_LIVE_N20_APPROVED=true TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB="$PICO_MEDIDO_GIB" python -m infra.runpod.n20.benchmark run \
+  --scenario pilot --seed 0 --snapshot "$TCC_LIVE_N20_SNAPSHOT" \
+  --output /caminho/novo/piloto-n20-r5-s0
+\`\`\`
+
+O manifesto separa pilot de official. O smoke sem GPU exercita HTTP e
+protocolo com um modelo substituto; nao e evidencia de inferencia BF16,
+capacidade do servidor, nem robustez do protocolo oficial.
+
 ## Teste local sem subir resultados
 
 ```sh
 python -m infra.runpod.n20.integration_smoke run --output /caminho/novo/smoke-local
 ```
 
-O smoke percorre baseline e m80-alto (50 rodadas cada) com os endpoints, o
-supervisor e a coordenação reais, substituindo apenas o gerador por um modelo
-de teste. Verifica as 1.000 gerações por cenário, a perturbação, as cadeias
-e o fechamento dos processos/portas. Saídas de teste ficam locais e fora do
-Git e não contam como resultados de produção.
+O smoke executa o piloto honesto (100 geracoes) e C13 (1.000 geracoes),
+com endpoints e protocolo reais e um modelo substituto, sem CUDA.
+Verifica agenda, registros de genese, omissoes apos geracao, cadeias,
+metricas e fechamento dos processos/portas. Nenhum resultado vai ao Git.
 
 ## Checklist antes do servidor: resultados e desligamento
 
-**Hoje:** o supervisor encerra seus processos de nós e orquestrador, inclusive
-em erro. O limite do job não garante desligamento do host/GPU. O workflow
-real, se habilitado, guarda artefatos no GitHub; não envia ao S3 e não encerra
-ou provisiona o servidor. A campanha legada RunPod/R2 não é compatível com
-este perfil. Não reutilize o controlador legado como se validasse o N20.
+**Hoje:** o supervisor encerra seus processos, inclusive em erro; isso
+nao encerra a alocacao do host. Nao ha upload automatico ao GitHub nem S3.
+Um teste local isolado de um modelo com adaptador temporario de leitura dos
+pesos nao qualifica a imagem Linux nem a capacidade dos 20 nos concorrentes.
+A campanha legada RunPod/R2 nao e compativel com este perfil.
 
 **Antes de habilitar produção:**
 

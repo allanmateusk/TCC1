@@ -19,6 +19,7 @@ from .protocol import (
     Vote,
     apply_record,
     decide,
+    leaderless_calibration_round,
     objective_check,
     outcome_records,
     propose_record,
@@ -85,9 +86,17 @@ class Replica:
             self.members = [m for m in self.members if m not in refused]
         return decision, refused, leaving
 
+    def calibrate(self, record: RoundRecord) -> str:
+        if (record.kind != "calibration" or not leaderless_calibration_round(record.round_index, self.config)
+                or record.prev_hash != self.head or any(r.round_index == record.round_index for r in self.ledger.records)):
+            return "rejected"
+        self.ledger.append(record)
+        apply_record(self.state, record)
+        return "applied"
+
     def oracle(self, record: RoundRecord, votes: Optional[dict[str, bool]]) -> str:
         """Aplica a correção pelo gabarito (direto, ou se passou no quórum)."""
-        if record.prev_hash != self.head:
+        if record.kind != "oracle" or record.prev_hash != self.head:
             return "stale"
         if not self.config.defense.oracle_bypasses_quorum:
             members_votes = {n: ok for n, ok in (votes or {}).items() if n in self.members}

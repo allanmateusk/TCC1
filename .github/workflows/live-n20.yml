@@ -14,13 +14,8 @@ on:
       scenario:
         description: "Scenario to run (used only for live execution)"
         type: choice
-        default: baseline
-        options: [baseline, m20-alto, m40-alto, m80-alto, m40-sutil, m80-sutil]
-      seed:
-        description: "Scenario seed (0 to 4)"
-        type: choice
-        default: "0"
-        options: ["0", "1", "2", "3", "4"]
+        default: pilot
+        options: [pilot, C01, C16, C17, C10, C14, C11, C02, C03, C08, C04, C05, C09, C06, C07, C12, C15, C13]
       acknowledge_live:
         description: "Authorize this workflow to consume existing runner time (no provisioning)"
         type: boolean
@@ -74,23 +69,14 @@ jobs:
       NVIDIA_MODEL_SNAPSHOT: '${{ vars.TCC_LIVE_N20_SNAPSHOT }}'
       TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB: '${{ vars.TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB }}'
       SCENARIO: '${{ inputs.scenario }}'
-      SEED: '${{ inputs.seed }}'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Run and verify 1000 own generations
+      - name: Run and verify 100 pilot or 1000 official generations
         working-directory: n20-runtime
         run: |
           test -n "$NVIDIA_MODEL_SNAPSHOT"
           test -n "$TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB"
-          python -m infra.runpod.n20.benchmark run --scenario "$SCENARIO" --seed "$SEED" \
+          python -m infra.runpod.n20.benchmark run --scenario "$SCENARIO" --seed 0 \
             --snapshot "$NVIDIA_MODEL_SNAPSHOT" --output "$RUNNER_TEMP/tcc-n20-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-      - name: Save metrics, runtime records and logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: 'live-n20-${{ github.run_id }}-${{ github.run_attempt }}'
-          path: '${{ runner.temp }}/tcc-n20-${{ github.run_id }}-${{ github.run_attempt }}/'
-          if-no-files-found: ignore
-          retention-days: 14

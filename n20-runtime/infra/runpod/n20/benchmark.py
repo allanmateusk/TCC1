@@ -14,6 +14,8 @@ import tempfile
 import time
 
 from sistema.scripts import runpod_worker as worker
+from sistema.scripts.runner_containers import _write as write_json_atomically
+from . import campaign
 
 ROOT = Path(__file__).resolve().parents[3]
 PROFILE = Path(__file__).with_name("profile.json")
@@ -22,12 +24,14 @@ PROFILE = Path(__file__).with_name("profile.json")
 def load_profile():
     p = json.loads(PROFILE.read_text(encoding="utf-8"))
     if (p["schema"], p["nodes"], p["rounds"], p["gpu_count"], p["models_per_gpu"],
-        p["inference_layout"], p["quantization"]) != (
-        "tcc-live-n20/v1", 20, 50, 2, 10, "per_node", "nf4"
+        p["inference_layout"], p["quantization"], p["dtype"]) != (
+        "tcc-live-n20/v2", 20, 50, 2, 10, "per_node", "none", "bfloat16"
     ):
         raise ValueError("Invalid fixed N20 CUDA profile")
     if (p["model"], p["model_type"], p["thinking"]) != ("HuggingFaceTB/SmolLM3-3B", "smollm3", False):
         raise ValueError("This scenario is pinned to SmolLM3-3B with thinking disabled.")
+    if p["pilot_rounds"] != [5]:
+        raise ValueError("Baseline pilot length must be 5.")
     if not 0 < p["timeout_minutes"] <= 110:
         raise ValueError("The runtime limit must not exceed 110 minutes")
     taskfile = ROOT / p["task_file"]
@@ -37,41 +41,47 @@ def load_profile():
     tasks = json.loads(raw)["tarefas"]
     if len(tasks) != 50 or len({t["id"] for t in tasks}) != 50:
         raise ValueError("Need 50 distinct fixed tasks")
-    scenarios = {s["id"]: s for s in p["scenarios"]}
-    grid = {(s["malicious_nodes"], s["noise_mode"]) for s in scenarios.values()}
-    if len(p["scenarios"]) != 6 or len(scenarios) != 6 or grid != {
-        (0, "relative"), (4, "multiplicative"), (8, "multiplicative"),
-        (16, "multiplicative"), (8, "relative"), (16, "relative"),
-    } or p["seeds"] != list(range(5)):
-        raise ValueError("Unexpected N20 lab scenario grid")
+    campaign.validate(p)
+    scenarios = {s["id"]: s for s in (*p["scenarios"], p["pilot"])}
     return p, scenarios
 
 
-def scenario_args(profile, scenario, seed):
+def scenario_args(profile, scenario, seed, rounds=None):
+    pilot = scenario["id"] == "pilot"
+    expected_rounds = profile["pilot_rounds"][0] if pilot else profile["rounds"]
+    rounds = expected_rounds if rounds is None else rounds
+    if rounds != expected_rounds:
+        raise ValueError("Only the separate pilot supports 5 rounds; official scenarios require 50.")
     if seed not in profile["seeds"]:
         raise ValueError("Seed outside audited grid")
-    protocol = profile["protocol"]
+    protocol = {**profile["protocol"], **scenario}
+    schedule = campaign.plan(profile, scenario, seed, rounds)
+    if schedule["genesis_rounds"]:
+        protocol["signal"] = "hybrid"
     config = {
         "nodes": profile["nodes"], "gpu_count": profile["gpu_count"],
         "models_per_gpu": profile["models_per_gpu"], "model": profile["model"],
         "model_revision": profile["model_revision"], "task_bank": profile["task_file"],
+        "quantization": profile["quantization"], "dtype": profile["dtype"],
         "max_new_tokens": profile["max_new_tokens"], "temperature": profile["temperature"],
-        "top_p": profile["top_p"], "noise_mode": scenario["noise_mode"],
+        "top_p": profile["top_p"], "noise_mode": "multiplicative",
         "noise_distance": protocol["relative_noise_distance"],
         **{k: protocol[k] for k in ("degree", "topology", "signal", "consensus_mode", "consensus_center",
                                    "mechanism", "defense", "audit_mode", "malicious_strategy", "collusion_value")},
     }
     entry = {
-        "id": f"live-n20-r50-{scenario['id']}-s{seed}",
-        "rounds": profile["rounds"], "semente": seed,
+        "id": f"{'pilot' if pilot else 'live'}-n20-r{rounds}-{scenario['id']}-s{seed}",
+        "rounds": rounds, "semente": seed, "run_kind": "pilot" if pilot else "official",
+        "expected_own_generations": profile["nodes"] * rounds,
         "fracao_maliciosos": scenario["malicious_nodes"] / profile["nodes"],
         "nota": protocol["score"], "honest_rounds": protocol["honest_rounds"], "audit_p": protocol["audit_p"],
+        "audit_plan": schedule,
     }
     return config, entry
 
 
-def check_mapping(profile, scenario, seed, root, snapshot):
-    config, entry = scenario_args(profile, scenario, seed)
+def check_mapping(profile, scenario, seed, root, snapshot, rounds=None):
+    config, entry = scenario_args(profile, scenario, seed, rounds)
     processes, protocol = worker.scenario_configuration(config, entry, root, snapshot)
     keys = list(processes)
     per_gpu = [sum(slot == gpu for slot, _ in processes.values()) for gpu in range(profile["gpu_count"])]
@@ -82,13 +92,20 @@ def check_mapping(profile, scenario, seed, root, snapshot):
     malicious = 0
     for node_id, (_, env) in processes.items():
         if any(env.get(k) != v for k, v in {
-            "MODEL_RUN_ID": entry["id"], "MODEL_DEVICE": "cuda", "MODEL_QUANTIZATION": "nf4",
+            "MODEL_RUN_ID": entry["id"], "MODEL_DEVICE": "cuda",
+            "MODEL_QUANTIZATION": profile["quantization"], "MODEL_DTYPE": profile["dtype"],
+            "ROUNDS": str(entry["rounds"]),
             "INFERENCE_MODE": "model", "MODEL_CACHE_DIR": str(root / "node-models" / node_id),
         }.items()):
             raise ValueError("Unexpected node inference runtime")
         malicious += env.get("PROFILE") == "malicious"
     if malicious != scenario["malicious_nodes"]:
         raise ValueError("Bad malicious node count")
+    if protocol["audit_rounds_override"] != [r-1 for r in entry["audit_plan"]["planned_rounds"]]:
+        raise ValueError("Orchestrator audit calendar differs from plan")
+    for node_id, (_, env) in processes.items():
+        if json.loads(env["AUDIT_ROUNDS_OVERRIDE"]) != protocol["audit_rounds_override"]:
+            raise ValueError(f"Node {node_id} audit calendar differs from coordinator")
 
 
 def preflight(profile, scenarios):
@@ -97,14 +114,15 @@ def preflight(profile, scenarios):
         for scenario in scenarios.values():
             for seed in profile["seeds"]:
                 check_mapping(profile, scenario, seed, root, root)
-    print("30 combinations validated offline; 20 model processes; 10 per GPU; 50 rounds each.")
+    print("Offline: 17 official scenarios and one separate baseline pilot; 20 BF16 processes, 10 per GPU.")
 
 
-def live(profile, scenario, seed, snapshot, out):
+def live(profile, scenario, seed, snapshot, out, rounds=None):
     if os.getenv("TCC_LIVE_N20_APPROVED") != "true":
         raise RuntimeError("Set explicit live execution approval before running.")
     if sys.platform != "linux":
         raise RuntimeError("Live launch requires a dedicated Linux CUDA runner.")
+    config, entry = scenario_args(profile, scenario, seed, rounds)
     snapshot = snapshot.resolve(strict=True)
     if snapshot.name != profile["model_revision"] or not (snapshot / "config.json").is_file() or not list(snapshot.glob("*.safetensors")):
         raise ValueError("Select the preinstalled snapshot pinned by profile.json.")
@@ -116,8 +134,9 @@ def live(profile, scenario, seed, snapshot, out):
         per_node_gib = float(measured)
     except ValueError as exc:
         raise ValueError("Record the measured site-specific peak VRAM per Smol node first.") from exc
-    if not math.isfinite(per_node_gib) or per_node_gib <= 0:
-        raise ValueError("Peak VRAM needs a positive finite measurement.")
+    weights_gib = 6_150_197_248 / 1024 ** 3  # BF16 tensor bytes in the pinned snapshot.
+    if not math.isfinite(per_node_gib) or per_node_gib < weights_gib:
+        raise ValueError("Peak VRAM must be measured and cannot be below the BF16 weights.")
     required_gib = per_node_gib * profile["models_per_gpu"] * profile["vram_headroom"]
     import torch
     n = profile["gpu_count"]
@@ -128,19 +147,24 @@ def live(profile, scenario, seed, snapshot, out):
         raise RuntimeError("Invalid CUDA_VISIBLE_DEVICES mapping.")
     free_vram_gib = [torch.cuda.mem_get_info(i)[0] / 1024 ** 3 for i in range(n)]
     for i, free_gib in enumerate(free_vram_gib):
+        with torch.cuda.device(i):
+            if not torch.cuda.is_bf16_supported(including_emulation=False):
+                raise RuntimeError(f"CUDA device {i} does not support native BF16.")
         if free_gib < required_gib:
             raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {required_gib:.2f} GiB required.")
-    config, entry = scenario_args(profile, scenario, seed)
     out = out.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    check_mapping(profile, scenario, seed, out, snapshot)
+    check_mapping(profile, scenario, seed, out, snapshot, rounds)
     metadata = {"profile": profile, "scenario": entry, "started": datetime.now(timezone.utc).isoformat(),
                 "devices": [torch.cuda.get_device_name(i) for i in range(n)],
                 "vram_per_node_peak_gib": per_node_gib, "vram_required_per_gpu_gib": required_gib,
                 "vram_available_gib": free_vram_gib,
-                "expected_own_generations": 1000, "completed": False, "git_sha": os.getenv("GITHUB_SHA", "")}
+                "run_kind": entry["run_kind"], "rounds": entry["rounds"],
+                "expected_own_generations": entry["expected_own_generations"],
+                "quantization": profile["quantization"], "dtype": profile["dtype"],
+                "completed": False, "git_sha": os.getenv("GITHUB_SHA", "")}
     record = out / "live-run.json"
-    record.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    write_json_atomically(record, metadata)
     deadline = time.monotonic() + 60 * profile["timeout_minutes"]
     interrupted = False
 
@@ -167,8 +191,9 @@ def live(profile, scenario, seed, snapshot, out):
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-    metadata.update(completed=True, verified_own_generations=1000, finished=datetime.now(timezone.utc).isoformat())
-    record.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    metadata.update(completed=True, verified_own_generations=entry["expected_own_generations"],
+                    finished=datetime.now(timezone.utc).isoformat())
+    write_json_atomically(record, metadata)
 
 
 def main():
@@ -176,16 +201,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
     sub.add_parser("preflight")
+    plan = sub.add_parser("plan", help="Print the schedule without starting any process.")
+    plan.add_argument("--scenario", choices=scenarios)
     run = sub.add_parser("run")
     run.add_argument("--scenario", choices=scenarios, required=True)
     run.add_argument("--seed", choices=profile["seeds"], type=int, required=True)
     run.add_argument("--snapshot", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
+    run.add_argument("--rounds", type=int, choices=(*profile["pilot_rounds"], profile["rounds"]),
+                     default=None, help="Optional check: 5 for pilot, 50 for official scenarios.")
     args = parser.parse_args()
     if args.operation == "preflight":
         preflight(profile, scenarios)
+    elif args.operation == "plan":
+        chosen = (scenarios[args.scenario],) if args.scenario else tuple(scenarios.values())
+        print(json.dumps([scenario_args(profile, x, 0)[1] for x in chosen], indent=2))
     else:
-        live(profile, scenarios[args.scenario], args.seed, args.snapshot, args.output)
+        live(profile, scenarios[args.scenario], args.seed, args.snapshot, args.output, args.rounds)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ mantendo o servidor responsivo (coleta assíncrona pelo orquestrador).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -109,7 +110,8 @@ async def health() -> dict:
     if INFERENCE_MODE == "model" and os.getenv("MODEL_RUN_ID"):
         value.update(model_loaded=_dedicated_backend is not None and _dedicated_backend.loaded,
                      model_instances=1 if _dedicated_backend is not None and _dedicated_backend.loaded else 0,
-                     quantization=os.getenv("MODEL_QUANTIZATION"))
+                     quantization=_dedicated_backend.quantization if _dedicated_backend else None,
+                     dtype=_dedicated_backend.dtype if _dedicated_backend else None)
     return value
 
 
@@ -172,6 +174,7 @@ def _get_dedicated_backend() -> DedicatedModel:
                 node_id=NODE_ID, run_id=os.environ["MODEL_RUN_ID"], model_name=MODEL_NAME,
                 cache_dir=os.environ["MODEL_CACHE_DIR"], quantization=os.getenv("MODEL_QUANTIZATION", "nf4"),
                 device=os.getenv("MODEL_DEVICE", "cuda"), revision=os.getenv("MODEL_REVISION"),
+                dtype=os.getenv("MODEL_DTYPE"),
                 max_new_tokens=int(os.getenv("MODEL_MAX_NEW_TOKENS", "256")),
                 temperature=float(os.getenv("MODEL_TEMPERATURE", "0.7")), top_p=float(os.getenv("MODEL_TOP_P", "0.95")))
         return _dedicated_backend
@@ -226,6 +229,10 @@ async def _dedicated_inference(request: InferRequest) -> tuple[Optional[Answer],
             answer = behavior.corrupt_with_noise(base, rng)
         else:
             raise ValueError("Modo de ruído inválido.")
+    if request.round_index in _campaign_absences:
+        if PROFILE != behavior.MALICIOUS:
+            raise ValueError("Campaign can suppress only configured colluders")
+        answer = None  # Raw fresh generation already durable; this is a submission omission.
     await asyncio.to_thread(_get_dedicated_backend().record_response, request.round_index, answer, base_id)
     return answer, latency
 
@@ -333,6 +340,9 @@ _rounds = int(os.getenv("ROUNDS", "20"))
 _test_every = int(os.getenv("TEST_EVERY", "10"))
 _audited = plan_audits(int(os.getenv("EXPERIMENT_SEED", "0")), _rounds, _test_every,
                        float(os.getenv("AUDIT_P", "0.1"))) if _audit_mode == "random" else frozenset()
+if "AUDIT_ROUNDS_OVERRIDE" in os.environ:
+    _audited = frozenset(json.loads(os.environ["AUDIT_ROUNDS_OVERRIDE"]))
+_campaign_absences = frozenset(json.loads(os.getenv("N20_SIMULATED_ABSENCES", "[]")))
 _protocol = ProtocolConfig(
     signal=os.getenv("SIGNAL", "hybrid"),
     alpha=float(os.getenv("ALPHA", "0.3")),
@@ -349,7 +359,8 @@ _protocol = ProtocolConfig(
     audited_rounds=_audited,
     alpha_up=float(os.getenv("ALPHA_UP", "0.1")),
     defense=with_overrides(
-        defense_preset(os.getenv("DEFENSE", "all")),
+        replace(defense_preset(os.getenv("DEFENSE", "all")),
+                leaderless_calibration=os.getenv("LEADERLESS_CALIBRATION") == "1"),
         calibration_rounds=os.getenv("CALIBRATION_ROUNDS"),
         consensus_alpha=os.getenv("CONSENSUS_ALPHA"),
         oracle_alpha=os.getenv("ORACLE_ALPHA"),
@@ -578,14 +589,23 @@ async def oracle_vote() -> dict:
 @app.post("/oracle")
 async def oracle(message: OracleMessage) -> dict:
     replica = _require_replica()
-    status = replica.oracle(RoundRecord.from_json(message.record), message.votes)
+    record = RoundRecord.from_json(message.record)
+    if record.kind == "calibration":
+        observed = _answers.get(record.round_index)
+        listed = record.responses_map()
+        status = (replica.calibrate(record) if observed is not None and NODE_ID in listed
+                  and listed[NODE_ID] == observed[0] and record.expected is not None else "rejected")
+    else:
+        status = replica.oracle(record, message.votes)
     return {"node_id": NODE_ID, "status": status, "head": replica.head}
 
 
 @app.get("/answer")
 async def answer(round_index: int) -> dict:
     value, latency = _answers.get(round_index, (None, 0))
-    return {"node_id": NODE_ID, "round_index": round_index, "answer": value, "latency_ms": latency, "received": round_index in _answers}
+    return {"node_id": NODE_ID, "round_index": round_index, "answer": value, "latency_ms": latency,
+            "received": round_index in _answers,
+            "intentional_absence": round_index in _campaign_absences and round_index in _answers}
 
 
 @app.get("/state")

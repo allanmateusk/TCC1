@@ -17,11 +17,13 @@ import time
 class DedicatedModel:
     def __init__(self, *, node_id, run_id, model_name, cache_dir, quantization="nf4",
                  device="cuda", revision=None, max_new_tokens=256, temperature=.7,
-                 top_p=.95, factory=None):
-        if quantization != "nf4" or device != "cuda":
-            raise ValueError("Dedicated inference requires NF4 on CUDA")
+                 top_p=.95, factory=None, dtype=None):
+        dtype = dtype or {"nf4": "float16", "none": "bfloat16"}.get(quantization)
+        if device != "cuda" or (quantization, dtype) not in (("nf4", "float16"), ("none", "bfloat16")):
+            raise ValueError("Dedicated CUDA inference requires NF4/float16 or unquantized bfloat16")
         self.node_id, self.run_id = node_id, run_id
         self.model_name, self.quantization, self.device = model_name, quantization, device
+        self.dtype = dtype
         self.max_new_tokens, self.temperature, self.top_p = max_new_tokens, temperature, top_p
         self.lock = threading.RLock()
         self.model = None
@@ -31,6 +33,8 @@ class DedicatedModel:
         identity = {"run_id": run_id, "node_id": node_id, "model": model_name,
                     "revision": revision, "quantization": quantization, "device": device,
                     "max_new_tokens": max_new_tokens, "temperature": temperature, "top_p": top_p}
+        if quantization == "none":
+            identity["dtype"] = dtype
         self.config = json.dumps(identity, sort_keys=True, ensure_ascii=False)
         with closing(self._connect()) as db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -54,7 +58,9 @@ class DedicatedModel:
                 if self.factory is None:
                     from .inference import ModelBackend
                     self.model = ModelBackend(self.model_name, device=self.device,
-                                              max_new_tokens=self.max_new_tokens, quantization=self.quantization)
+                                              max_new_tokens=self.max_new_tokens,
+                                              quantization=None if self.quantization == "none" else self.quantization,
+                                              dtype=self.dtype)
                 else:
                     self.model = self.factory()
                 if self.factory is None:
@@ -66,6 +72,9 @@ class DedicatedModel:
         import torch
         data = {"node_id": self.node_id, "run_id": self.run_id,
                 "device_name": torch.cuda.get_device_name(0),
+                "quantization": self.quantization, "dtype": self.dtype,
+                "loaded_model_dtype": str(self.model.model.dtype),
+                "kv_cache": self.model.model.generation_config.use_cache,
                 "allocated_bytes": torch.cuda.memory_allocated(0),
                 "reserved_bytes": torch.cuda.memory_reserved(0),
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(0),

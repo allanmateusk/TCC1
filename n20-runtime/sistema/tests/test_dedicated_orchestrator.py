@@ -52,7 +52,7 @@ class DedicatedOrchestratorTest(unittest.TestCase):
              mock.patch.object(run, "load_tasks", return_value=[{"id": "t", "question": "q", "answer": 1}]), \
              mock.patch.object(run, "_get", new=mock.AsyncMock(side_effect=get)), \
              mock.patch.object(run, "_lead_group", new=mock.AsyncMock(return_value=mock.Mock(refusers=[]))), \
-             mock.patch.object(run, "_judge", new=mock.AsyncMock(side_effect=RuntimeError("audit not applied"))) as judge:
-            with self.assertRaisesRegex(RuntimeError, "audit not applied"):
+             mock.patch.object(run, "_judge", new=mock.AsyncMock(return_value={
+                 **{f"node-{i}": "applied" for i in range(5)}, "node-5": "blocked"})):
+            with self.assertRaisesRegex(RuntimeError, "Ground truth was not applied.*blocked"):
                 asyncio.run(run.run_dynamic_experiment(self.config(temp, "model")))
-        self.assertIs(judge.call_args.kwargs["require_applied"], True)

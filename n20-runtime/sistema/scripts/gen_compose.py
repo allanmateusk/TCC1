@@ -87,8 +87,11 @@ def build_configuration(args: argparse.Namespace) -> tuple[dict, dict]:
         raise ValueError("Somente a orquestração dinâmica é suportada.")
     dedicated = args.inference_mode == "model" and bool(getattr(args, "model_run_id", ""))
     if dedicated:
-        if args.model_quantization != "nf4" or args.model_device != "cuda":
-            raise ValueError("O modelo dedicado requer NF4 e CUDA.")
+        model_dtype = args.model_dtype or {"nf4": "float16", "none": "bfloat16"}[args.model_quantization]
+        if args.model_device != "cuda" or (args.model_quantization, model_dtype) not in (
+            ("nf4", "float16"), ("none", "bfloat16")
+        ):
+            raise ValueError("O modo dedicado requer CUDA com NF4/float16 ou sem quantização/bfloat16.")
         if args.gpu_count < 1 or args.models_per_gpu < 1 or math.ceil(args.nodes / args.gpu_count) > args.models_per_gpu:
             raise ValueError("Quantidade de modelos por GPU excede a capacidade configurada.")
         if not args.model_snapshot or not Path(args.model_snapshot).is_dir():
@@ -130,6 +133,7 @@ def build_configuration(args: argparse.Namespace) -> tuple[dict, dict]:
             if dedicated:
                 environment.update({
                     "MODEL_NAME": "/models", "MODEL_QUANTIZATION": args.model_quantization,
+                    "MODEL_DTYPE": model_dtype,
                     "MODEL_DEVICE": args.model_device, "MODEL_RUN_ID": args.model_run_id,
                     "MODEL_REVISION": args.model_revision or Path(args.model_snapshot).name,
                     "MODEL_CACHE_DIR": f"/app/{cache_root.as_posix()}/{node_id}",
@@ -263,7 +267,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--noise-mode", choices=("relative", "multiplicative"), default="relative")
     parser.add_argument("--noise-distance", type=float, default=0.2)
     parser.add_argument("--model", default="HuggingFaceTB/SmolLM3-3B")
-    parser.add_argument("--model-quantization", choices=("nf4",), default="nf4")
+    parser.add_argument("--model-quantization", choices=("nf4", "none"), default="nf4")
+    parser.add_argument("--model-dtype", choices=("float16", "bfloat16"), default=None)
     parser.add_argument("--model-device", choices=("cuda",), default="cuda")
     parser.add_argument("--model-run-id", default="")
     parser.add_argument("--model-cache-root", default="sistema/results/model-cache")

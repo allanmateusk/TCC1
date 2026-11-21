@@ -494,6 +494,12 @@ def log_round(
             is_test=is_test,
         )
 
+    for outcome in outcomes:
+        length, head = chains.get(outcome.gid, (0, ""))
+        logger.record_leadership(
+            leadership_row(outcome, round_index=round_index, profiles=profiles, chain_length=length, chain_head=head)
+        )
+
     logger.record_round(
         result,
         num_nodes=len(responses),
@@ -506,8 +512,3 @@ def log_round(
         audited=audited,
         calibration=calibration,
     )
-    for outcome in outcomes:
-        length, head = chains.get(outcome.gid, (0, ""))
-        logger.record_leadership(
-            leadership_row(outcome, round_index=round_index, profiles=profiles, chain_length=length, chain_head=head)
-        )
