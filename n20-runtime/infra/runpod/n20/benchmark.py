@@ -149,6 +149,45 @@ def verify_controller_arm(path, run_dir, resource_id, run_id, *, run_kind="pilot
     return binding.deadline
 
 
+def verify_cuda_hardware(profile, snapshot, *, resident_pool=None, measured_peak_gib=None):
+    snapshot = snapshot.resolve(strict=True)
+    if snapshot.name != profile["model_revision"] or not (snapshot / "config.json").is_file() or not list(snapshot.glob("*.safetensors")):
+        raise ValueError("Select the preinstalled snapshot pinned by profile.json.")
+    config_json = json.loads((snapshot / "config.json").read_text(encoding="utf-8"))
+    if config_json.get("model_type") != profile["model_type"] or not (snapshot / "chat_template.jinja").is_file():
+        raise ValueError("Invalid SmolLM3 snapshot architecture or missing official template.")
+    measured = os.getenv("TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB", "")
+    try:
+        per_node_gib = float(measured if measured_peak_gib is None else measured_peak_gib)
+    except ValueError as exc:
+        raise ValueError("Record the measured site-specific peak VRAM per Smol node first.") from exc
+    weights_gib = 6_150_197_248 / 1024 ** 3  # BF16 tensor bytes in the pinned snapshot.
+    if not math.isfinite(per_node_gib) or per_node_gib < weights_gib:
+        raise ValueError("Peak VRAM must be measured and cannot be below the BF16 weights.")
+    required_gib = per_node_gib * profile["models_per_gpu"] * profile["vram_headroom"]
+    import torch
+    n = profile["gpu_count"]
+    if not torch.cuda.is_available() or torch.cuda.device_count() != n:
+        raise RuntimeError("Select exactly two dedicated CUDA devices.")
+    devices = os.getenv("CUDA_VISIBLE_DEVICES", "0,1").split(",")
+    if len(devices) != n or len(set(devices)) != n or not all(devices):
+        raise RuntimeError("Invalid CUDA_VISIBLE_DEVICES mapping.")
+    free_vram_gib = [torch.cuda.mem_get_info(i)[0] / 1024 ** 3 for i in range(n)]
+    already_loaded=resident_pool is not None and bool(resident_pool.children)
+    if already_loaded and (resident_pool.closed or len(resident_pool.children)!=profile["nodes"]):
+        raise ValueError("Warmed GPU set is incomplete; cold fallback is forbidden")
+    # On subsequent reserved cases the verified residents already own weights.
+    # Subtract only pinned tensor bytes, never a measured peak or safety margin.
+    free_floor=required_gib if not already_loaded else required_gib - weights_gib*profile["models_per_gpu"]
+    for i, free_gib in enumerate(free_vram_gib):
+        with torch.cuda.device(i):
+            if not torch.cuda.is_bf16_supported(including_emulation=False):
+                raise RuntimeError(f"CUDA device {i} does not support native BF16.")
+        if free_gib < free_floor:
+            raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {free_floor:.2f} GiB required.")
+    return snapshot, per_node_gib, required_gib, free_vram_gib, devices, torch
+
+
 def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_root=None, run_id=None,
          controller_state=None, resource_id=None, recovery_permit=None, resident_pool=None, warm_case=None):
     if campaign_profiles.scope(profile):
@@ -188,41 +227,8 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
         raise ValueError("Live inference requires a clean tracked runtime at the recorded commit")
     if warm_case is not None:
         warm_case.verify_revision(git_sha,artifact_store.sha((Path(__file__).with_name("profile.json")).read_bytes().replace(b"\r\n",b"\n")))
-    snapshot = snapshot.resolve(strict=True)
-    if snapshot.name != profile["model_revision"] or not (snapshot / "config.json").is_file() or not list(snapshot.glob("*.safetensors")):
-        raise ValueError("Select the preinstalled snapshot pinned by profile.json.")
-    config_json = json.loads((snapshot / "config.json").read_text(encoding="utf-8"))
-    if config_json.get("model_type") != profile["model_type"] or not (snapshot / "chat_template.jinja").is_file():
-        raise ValueError("Invalid SmolLM3 snapshot architecture or missing official template.")
-    measured = os.getenv("TCC_LIVE_N20_PEAK_VRAM_PER_NODE_GIB", "")
-    try:
-        per_node_gib = float(measured)
-    except ValueError as exc:
-        raise ValueError("Record the measured site-specific peak VRAM per Smol node first.") from exc
-    weights_gib = 6_150_197_248 / 1024 ** 3  # BF16 tensor bytes in the pinned snapshot.
-    if not math.isfinite(per_node_gib) or per_node_gib < weights_gib:
-        raise ValueError("Peak VRAM must be measured and cannot be below the BF16 weights.")
-    required_gib = per_node_gib * profile["models_per_gpu"] * profile["vram_headroom"]
-    import torch
-    n = profile["gpu_count"]
-    if not torch.cuda.is_available() or torch.cuda.device_count() != n:
-        raise RuntimeError("Select exactly two dedicated CUDA devices.")
-    devices = os.getenv("CUDA_VISIBLE_DEVICES", "0,1").split(",")
-    if len(devices) != n or len(set(devices)) != n or not all(devices):
-        raise RuntimeError("Invalid CUDA_VISIBLE_DEVICES mapping.")
-    free_vram_gib = [torch.cuda.mem_get_info(i)[0] / 1024 ** 3 for i in range(n)]
-    already_loaded=resident_pool is not None and bool(resident_pool.children)
-    if already_loaded and (resident_pool.closed or len(resident_pool.children)!=profile["nodes"]):
-        raise ValueError("Warmed GPU set is incomplete; cold fallback is forbidden")
-    # On subsequent reserved cases the verified residents already own weights.
-    # Subtract only pinned tensor bytes, never a measured peak or safety margin.
-    free_floor=required_gib if not already_loaded else required_gib - weights_gib*profile["models_per_gpu"]
-    for i, free_gib in enumerate(free_vram_gib):
-        with torch.cuda.device(i):
-            if not torch.cuda.is_bf16_supported(including_emulation=False):
-                raise RuntimeError(f"CUDA device {i} does not support native BF16.")
-        if free_gib < free_floor:
-            raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {free_floor:.2f} GiB required.")
+    snapshot, per_node_gib, required_gib, free_vram_gib, devices, torch = verify_cuda_hardware(
+        profile,snapshot,resident_pool=resident_pool)
     from . import local_recovery
     out = run_dir
     entry["checkpoint_capture"]={"run_id":run_id,"git_sha":git_sha,"tasks_sha256":profile["task_sha256"],
