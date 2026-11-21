@@ -203,7 +203,7 @@ def _run_case(pool,admission,profile,scenarios,snapshot,root):
     return Seal(run,sid,store.sha(raw),len(raw)),out
 
 
-def _run_ordered(pool,admission,execute):
+def _run_ordered(pool,admission,execute,*,after_seal=None):
     reviewed=[]
     for index in range(admission.case_limit):
         if (admission.current["index"],admission.current["scenario_id"])!=(index,IDS[index]):
@@ -212,22 +212,45 @@ def _run_ordered(pool,admission,execute):
         if (seal.run_id,seal.scenario_id)!=(admission.current["run_id"],IDS[index]):
             raise ValueError("Local artifact was sealed for the wrong lease")
         reviewed.append((seal,path))
+        if after_seal is not None:
+            after_seal(admission,seal,path)
         if index+1<admission.case_limit:
             admission.await_next(seal,path)
             pool._accept_incremental_readback(admission)
     return reviewed
 
 
-def _supervise(*,full):
-    profile,scenarios=benchmark.load_profile("incremental-v1")
-    admission=WarmAdmission(profile,full=full)  # before consulting CUDA or opening residents
+def _validate_storage(admission,profile):
+    import os
     root=Path(admission.initial_trust["durable_root"])
     snapshot=Path(admission.initial_trust["snapshot"])
-    if (not root.is_absolute() or root.resolve(strict=True)!=root or not snapshot.is_absolute()
-        or snapshot.resolve(strict=True)!=snapshot or not snapshot.is_dir()):
-        raise ValueError("Exact durable mount and pinned local model snapshot needed")
+    if (not root.is_absolute() or root.resolve(strict=True)!=root or not root.is_dir()
+        or not os.access(root,os.W_OK|os.X_OK) or not snapshot.is_absolute()
+        or snapshot.resolve(strict=True)!=snapshot or not snapshot.is_dir()
+        or snapshot.name!=profile["model_revision"]
+        or not (snapshot/"config.json").is_file() or not (snapshot/"chat_template.jinja").is_file()
+        or not list(snapshot.glob("*.safetensors"))):
+        raise ValueError("Exact writable durable mount and pinned local model snapshot needed")
+    return root,snapshot
+
+
+def _supervise(*,full,admission=None,publication=None):
+    profile,scenarios=benchmark.load_profile("incremental-v1")
+    if admission is None:
+        admission=WarmAdmission(profile,full=full)  # before consulting CUDA or opening residents
+    if type(admission) is not WarmAdmission or admission.full is not full:
+        raise ValueError("Wrong protected warm admission")
+    if full:
+        from .incremental_warm_start import PutRelay
+        if type(publication) is not PutRelay or publication._admission is not admission:
+            raise ValueError("Authenticated publication gate must be provisioned before full startup")
+    elif publication is not None:
+        raise ValueError("Full publisher may not act in the two-case lane")
+    root,snapshot=_validate_storage(admission,profile)
+    admission.check()
     with ResidentPool(root,deadline=admission.cutoff,incremental_admission=admission) as pool:
-        seals=_run_ordered(pool,admission,lambda:_run_case(pool,admission,profile,scenarios,snapshot,root))
+        seals=_run_ordered(pool,admission,lambda:_run_case(pool,admission,profile,scenarios,snapshot,root),
+                           after_seal=publication.publish if full else None)
     return {"status":"verified_local_awaiting_last_external_get","seals":seals,
             "previous_independent_gets_verified":len(seals)-1,"last_independent_get_verified":False,
             "next_case_authorized":False,"provider_stop_asserted":False}
@@ -238,6 +261,6 @@ def supervise_two_cases():
     return _supervise(full=False)
 
 
-def supervise_full_campaign():
-    """Protected 20-case spine; requires a separately installed fully signed authority."""
-    return _supervise(full=True)
+def supervise_full_campaign(*,admission=None,publication=None):
+    """Protected 20-case spine; no GPU launch without admission and publication gate."""
+    return _supervise(full=True,admission=admission,publication=publication)
