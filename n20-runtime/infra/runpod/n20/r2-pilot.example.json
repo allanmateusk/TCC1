@@ -1,0 +1,6 @@
+{
+  "endpoint": "https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com",
+  "bucket": "tcc",
+  "region": "auto",
+  "prefix": "tcc/piloto"
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.terraform/
+*.tfstate*
+.env
+sistema/results/
+resultados/
+r2-pilot.local.json
+r2-official.local.json
+README-r2-local.md

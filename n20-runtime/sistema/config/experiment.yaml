@@ -1,0 +1,36 @@
+mode: simulation
+dataset: sample
+num_tasks: 10
+split: test
+rounds: 20
+alpha: 0.3
+timeout_s: 60.0
+output_dir: sistema/results/experimento
+seed: 10
+reputation_mechanism: ema
+initial_reputation: 0.5
+honest_p_correct: 0.9
+unstable_p_drop: 0.3
+unstable_p_correct: 0.5
+collusion_value: 999
+test_every: 10
+nodes:
+- id: node-0
+  url: http://node-0:8000
+  profile: malicious
+- id: node-1
+  url: http://node-1:8000
+  profile: honest
+- id: node-2
+  url: http://node-2:8000
+  profile: honest
+- id: node-3
+  url: http://node-3:8000
+  profile: honest
+orchestration: dynamic
+signal: hybrid
+topology: kregular
+degree: 2
+defense: all
+leader_attack: none
+auditor_attack: none
