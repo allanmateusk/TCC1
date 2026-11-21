@@ -20,19 +20,21 @@ from sistema.scripts.runner_containers import _write as write_json_atomically
 from . import artifact_store, campaign, watchdog
 
 ROOT = Path(__file__).resolve().parents[3]
+from . import campaign_profiles
+
 PROFILE = Path(__file__).with_name("profile.json")
 
 
-def load_profile():
-    p = json.loads(PROFILE.read_text(encoding="utf-8"))
-    if (p["schema"], p["nodes"], p["rounds"], p["gpu_count"], p["models_per_gpu"],
+def load_profile(selector="legacy"):
+    p = campaign_profiles.resolve(selector)
+    if (p["nodes"], p["rounds"], p["gpu_count"], p["models_per_gpu"],
         p["inference_layout"], p["quantization"], p["dtype"]) != (
-        "tcc-live-n20/v2", 20, 50, 2, 10, "per_node", "none", "bfloat16"
+        20, 50, 2, 10, "per_node", "none", "bfloat16"
     ):
         raise ValueError("Invalid fixed N20 CUDA profile")
     if (p["model"], p["model_type"], p["thinking"]) != ("HuggingFaceTB/SmolLM3-3B", "smollm3", False):
         raise ValueError("This scenario is pinned to SmolLM3-3B with thinking disabled.")
-    if p["pilot_rounds"] != [5]:
+    if not campaign_profiles.scope(p) and p["pilot_rounds"] != [5]:
         raise ValueError("Baseline pilot length must be 5.")
     if not 0 < p["timeout_minutes"] <= 110:
         raise ValueError("The runtime limit must not exceed 110 minutes")
@@ -43,13 +45,17 @@ def load_profile():
     tasks = json.loads(raw)["tarefas"]
     if len(tasks) != 50 or len({t["id"] for t in tasks}) != 50:
         raise ValueError("Need 50 distinct fixed tasks")
-    campaign.validate(p)
-    scenarios = {s["id"]: s for s in (*p["scenarios"], p["pilot"])}
+    scenarios = {s["id"]: s for s in p["scenarios"]}
+    if "pilot" in p:
+        scenarios["pilot"] = p["pilot"]
     return p, scenarios
 
 
 def scenario_args(profile, scenario, seed, rounds=None):
     pilot = scenario["id"] == "pilot"
+    scope = campaign_profiles.scope(profile)
+    if pilot and scope:
+        raise ValueError("This campaign has no pilot phase")
     expected_rounds = profile["pilot_rounds"][0] if pilot else profile["rounds"]
     rounds = expected_rounds if rounds is None else rounds
     if rounds != expected_rounds:
@@ -57,7 +63,7 @@ def scenario_args(profile, scenario, seed, rounds=None):
     if seed not in profile["seeds"]:
         raise ValueError("Seed outside audited grid")
     protocol = {**profile["protocol"], **scenario}
-    schedule = campaign.plan(profile, scenario, seed, rounds)
+    schedule = campaign_profiles.plan(profile, scenario, seed, rounds)
     if schedule["genesis_rounds"]:
         protocol["signal"] = "hybrid"
     config = {
@@ -69,16 +75,21 @@ def scenario_args(profile, scenario, seed, rounds=None):
         "top_p": profile["top_p"], "noise_mode": "multiplicative",
         "noise_distance": protocol["relative_noise_distance"],
         **{k: protocol[k] for k in ("degree", "topology", "signal", "consensus_mode", "consensus_center",
-                                   "mechanism", "defense", "audit_mode", "malicious_strategy", "collusion_value")},
+                                   "mechanism", "defense", "audit_mode", "malicious_strategy")},
+        "collusion_value":protocol.get("collusion_value",999),
     }
     entry = {
-        "id": f"{'pilot' if pilot else 'live'}-n20-r{rounds}-{scenario['id']}-s{seed}",
+        "id": campaign_profiles.experiment_id(profile,scenario["id"],seed,rounds),
         "rounds": rounds, "semente": seed, "run_kind": "pilot" if pilot else "official",
         "expected_own_generations": profile["nodes"] * rounds,
         "fracao_maliciosos": scenario["malicious_nodes"] / profile["nodes"],
         "nota": protocol["score"], "honest_rounds": protocol["honest_rounds"], "audit_p": protocol["audit_p"],
         "audit_plan": schedule,
     }
+    if scope:
+        config.update({k: protocol[k] for k in ("noise_policy","consensus_alpha","oracle_alpha","test_every")})
+        config["audit_mode"] = scenario["audit"]
+        entry.update(scope,collusion=scenario["collusion"],unstable_nodes=scenario["unstable_nodes"])
     return config, entry
 
 
@@ -116,10 +127,14 @@ def preflight(profile, scenarios):
         for scenario in scenarios.values():
             for seed in profile["seeds"]:
                 check_mapping(profile, scenario, seed, root, root)
-    print("Offline: 17 official scenarios and one separate baseline pilot; 20 BF16 processes, 10 per GPU.")
+    if campaign_profiles.scope(profile):
+        print(f"Offline candidate only: {len(scenarios)} versioned incremental cases; 20 BF16 processes, 10 per GPU.")
+    else:
+        print("Offline: 17 official scenarios and one separate baseline pilot; 20 BF16 processes, 10 per GPU.")
 
 
-def verify_controller_arm(path, run_dir, resource_id, run_id, *, run_kind="pilot", scenario_id="pilot", now=None):
+def verify_controller_arm(path, run_dir, resource_id, run_id, *, run_kind="pilot", scenario_id="pilot", now=None,
+                          campaign_id=None, profile_sha256=None):
     """Require separately owned controller state; deployment must also prove scheduler/TTL."""
     if path is None or not Path(path).is_absolute() or Path(path).is_symlink():
         raise ValueError("An independent controller arm record is required")
@@ -127,14 +142,17 @@ def verify_controller_arm(path, run_dir, resource_id, run_id, *, run_kind="pilot
     if path.is_relative_to(run_dir.parent) or path.is_relative_to(ROOT.parent):
         raise ValueError("Controller state cannot reside in the runner project or output volume")
     tick = time.time() if now is None else now
-    binding = watchdog.require_armed(path,tick,run_id=run_id,run_kind=run_kind,scenario_id=scenario_id)
+    binding = watchdog.require_armed(path,tick,run_id=run_id,run_kind=run_kind,scenario_id=scenario_id,
+                                     campaign_id=campaign_id,profile_sha256=profile_sha256)
     if binding.resource_id != resource_id or binding.bucket != "tcc":
         raise ValueError("Controller state is stale, closed or bound to another resource")
     return binding.deadline
 
 
 def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_root=None, run_id=None,
-         controller_state=None, resource_id=None, recovery_permit=None):
+         controller_state=None, resource_id=None, recovery_permit=None, resident_pool=None, warm_case=None):
+    if campaign_profiles.scope(profile):
+        raise RuntimeError("Incremental campaign is not qualified; plan and preflight only.")
     if os.getenv("TCC_LIVE_N20_APPROVED") != "true":
         raise RuntimeError("Set explicit live execution approval before running.")
     if sys.platform != "linux":
@@ -144,9 +162,23 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
         raise ValueError("Official case disabled until the independent provider lifecycle is qualified")
     if recovery_permit is not None and os.getenv("TCC_N20_RECOVERY_QUALIFIED") != "true":
         raise ValueError("Real restart disabled until independent controller fencing is qualified")
+    if (resident_pool is None)!=(warm_case is None):
+        raise ValueError("Resident pool and independent batch grant must be supplied together")
+    if resident_pool is not None and os.getenv("TCC_N20_RESIDENT_QUALIFIED")!="true":
+        raise ValueError("Resident GPU execution is disabled until the independent batch is qualified")
+    if resident_pool is not None:
+        from sistema.scripts.resident_pool import ResidentPool
+        if not isinstance(resident_pool,ResidentPool) or resident_pool.test_transport:
+            raise ValueError("A test or unknown resident launcher cannot produce real evidence")
     run_dir = artifact_store.durable_run(durable_root, run_id, repo=ROOT.parent)
-    provider_deadline = verify_controller_arm(controller_state, run_dir, resource_id, run_id,
-                                              run_kind=entry["run_kind"], scenario_id=scenario["id"])
+    if resident_pool is None:
+        provider_deadline = verify_controller_arm(controller_state, run_dir, resource_id, run_id,
+                                                  run_kind=entry["run_kind"], scenario_id=scenario["id"])
+    else:
+        from .warm_batch import WarmCase
+        if not isinstance(warm_case,WarmCase) or controller_state is not None:
+            raise ValueError("Use the independently owned batch, not the per-case stop controller")
+        provider_deadline=warm_case.verify(resource_id=resource_id,run_id=run_id,entry=entry,scenario=scenario["id"])
     if out is not None and out.resolve() != run_dir:
         raise ValueError("Output must match durable-root/run-id")
     git_sha = subprocess.check_output(["git", "-C", str(ROOT.parent), "rev-parse", "HEAD"], text=True).strip()
@@ -154,6 +186,8 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
         raise ValueError("An identified Git checkout is required")
     if subprocess.run(["git", "-C", str(ROOT.parent), "diff", "--quiet", "HEAD", "--", "n20-runtime"]).returncode:
         raise ValueError("Live inference requires a clean tracked runtime at the recorded commit")
+    if warm_case is not None:
+        warm_case.verify_revision(git_sha,artifact_store.sha((Path(__file__).with_name("profile.json")).read_bytes().replace(b"\r\n",b"\n")))
     snapshot = snapshot.resolve(strict=True)
     if snapshot.name != profile["model_revision"] or not (snapshot / "config.json").is_file() or not list(snapshot.glob("*.safetensors")):
         raise ValueError("Select the preinstalled snapshot pinned by profile.json.")
@@ -177,16 +211,22 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
     if len(devices) != n or len(set(devices)) != n or not all(devices):
         raise RuntimeError("Invalid CUDA_VISIBLE_DEVICES mapping.")
     free_vram_gib = [torch.cuda.mem_get_info(i)[0] / 1024 ** 3 for i in range(n)]
+    already_loaded=resident_pool is not None and bool(resident_pool.children)
+    if already_loaded and (resident_pool.closed or len(resident_pool.children)!=profile["nodes"]):
+        raise ValueError("Warmed GPU set is incomplete; cold fallback is forbidden")
+    # On subsequent reserved cases the verified residents already own weights.
+    # Subtract only pinned tensor bytes, never a measured peak or safety margin.
+    free_floor=required_gib if not already_loaded else required_gib - weights_gib*profile["models_per_gpu"]
     for i, free_gib in enumerate(free_vram_gib):
         with torch.cuda.device(i):
             if not torch.cuda.is_bf16_supported(including_emulation=False):
                 raise RuntimeError(f"CUDA device {i} does not support native BF16.")
-        if free_gib < required_gib:
-            raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {required_gib:.2f} GiB required.")
+        if free_gib < free_floor:
+            raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {free_floor:.2f} GiB required.")
     from . import local_recovery
     out = run_dir
     entry["checkpoint_capture"]={"run_id":run_id,"git_sha":git_sha,"tasks_sha256":profile["task_sha256"],
-                                 "scenario_id":scenario["id"]}
+                                 "scenario_id":scenario["id"],**campaign_profiles.scope(profile)}
     restart_digest=None
     if recovery_permit is None:
         artifact_store.create_run_directory(out)
@@ -208,11 +248,12 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
                 raise ValueError("Run lifecycle is complete or differs from the protected recovery identity")
             artifact_store.write_atomic(out/f"live-before-recovery-{restart_digest[:16]}.json",old_raw)
         _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha,run_id,provider_deadline,
-                      per_node_gib,required_gib,free_vram_gib,devices,torch,restart_digest)
+                      per_node_gib,required_gib,free_vram_gib,devices,torch,restart_digest,
+                      resident_pool=resident_pool,warm_case=warm_case)
 
 
 def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha,run_id,provider_deadline,
-                  per_node_gib,required_gib,free_vram_gib,devices,torch,restart_digest):
+                  per_node_gib,required_gib,free_vram_gib,devices,torch,restart_digest, *, resident_pool=None,warm_case=None):
     n=len(devices)
     check_mapping(profile, scenario, seed, out, snapshot, rounds)
     metadata = {"profile": profile, "scenario": entry, "started": datetime.now(timezone.utc).isoformat(),
@@ -225,7 +266,9 @@ def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha
                 "run_kind": entry["run_kind"], "rounds": entry["rounds"],
                 "expected_own_generations": entry["expected_own_generations"],
                 "quantization": profile["quantization"], "dtype": profile["dtype"],
-                "completed": False, "git_sha": git_sha}
+                "completed": False, "git_sha": git_sha,**campaign_profiles.scope(profile)}
+    if resident_pool is not None:
+        metadata["layout"]="resident_model_per_node"
     record = out / "live-run.json"
     write_json_atomically(record, metadata)
     deadline = time.monotonic() + min(60 * profile["timeout_minutes"], provider_deadline - time.time())
@@ -237,7 +280,7 @@ def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha
         tick = time.monotonic()
         if force or tick - last_heartbeat >= 15:
             artifact_store.write_atomic(out / "heartbeat.json", artifact_store.json_bytes(
-                {"run_id": run_id, "heartbeat_at_epoch": time.time()}), replace=True)
+                {"run_id": run_id, "heartbeat_at_epoch": time.time(),**campaign_profiles.scope(profile)}), replace=True)
             last_heartbeat = tick
 
     heartbeat(force=True)
@@ -250,6 +293,8 @@ def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha
         if interrupted or time.monotonic() >= deadline:
             raise InterruptedError("Live run cancelled or deadline reached.")
         heartbeat()
+        if warm_case is not None:
+            warm_case.check()
 
     last = None
 
@@ -263,7 +308,10 @@ def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha
     previous = {s: signal.signal(s, stop) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
         worker.execute_scenario(out, entry, config, snapshot, devices, check, progress,
-                                restart_digest=restart_digest)
+                                restart_digest=restart_digest,resident_pool=resident_pool,
+                                case_deadline=provider_deadline)
+        if warm_case is not None:
+            check()
         finalized = {**metadata, "status": "verified_local", "completed": True,
                      "verified_own_generations": entry["expected_own_generations"],
                      "finished": datetime.now(timezone.utc).isoformat()}
@@ -280,8 +328,11 @@ def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha
 
 
 def main():
-    profile, scenarios = load_profile()
-    parser = argparse.ArgumentParser(description=__doc__)
+    bootstrap=argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--campaign",choices=campaign_profiles.SELECTORS,default="legacy")
+    selected,_=bootstrap.parse_known_args()
+    profile, scenarios = load_profile(selected.campaign)
+    parser = argparse.ArgumentParser(description=__doc__,parents=[bootstrap])
     sub = parser.add_subparsers(dest="operation", required=True)
     sub.add_parser("preflight")
     plan = sub.add_parser("plan", help="Print the schedule without starting any process.")
@@ -296,7 +347,7 @@ def main():
     run.add_argument("--recovery-permit", type=Path, help="Controller-owned fence attestation for a qualified same-run restart.")
     run.add_argument("--resource-id", required=True)
     run.add_argument("--output", type=Path, help="Optional check: must equal durable-root/run-id.")
-    run.add_argument("--rounds", type=int, choices=(*profile["pilot_rounds"], profile["rounds"]),
+    run.add_argument("--rounds", type=int, choices=(*profile.get("pilot_rounds",()), profile["rounds"]),
                      default=None, help="Optional check: 5 for pilot, 50 for official scenarios.")
     args = parser.parse_args()
     if args.operation == "preflight":

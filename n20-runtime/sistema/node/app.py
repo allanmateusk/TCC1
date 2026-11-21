@@ -43,10 +43,11 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, StrictInt
 
 from ..core import behavior
 from ..core.answer import Answer, normalize
+from .incremental import transform as incremental_output
 from ..core.distance import choose_weighted
 from ..core.defenses import preset as defense_preset, with_overrides
 from ..core.ledger import RoundRecord
@@ -78,7 +79,7 @@ _config = behavior.BehaviorConfig(
 _rng = random.Random(SEED)
 _mock_backend = MockBackend(_config, _rng)
 _model_backend: Optional[ModelBackend] = None
-_dedicated_backend: Optional[DedicatedModel] = None
+_dedicated_backend = None  # A cold DedicatedModel or a private ResidentClient.
 _model_lock = threading.RLock()
 
 @asynccontextmanager
@@ -121,6 +122,12 @@ async def health() -> dict:
                      model_instances=1 if _dedicated_backend is not None and _dedicated_backend.loaded else 0,
                      quantization=_dedicated_backend.quantization if _dedicated_backend else None,
                      dtype=_dedicated_backend.dtype if _dedicated_backend else None)
+        if os.getenv("N20_RESIDENT_PORT") and _dedicated_backend is not None:
+            try:
+                await asyncio.to_thread(_dedicated_backend.ensure_loaded)
+            except Exception as exc:
+                raise HTTPException(status_code=503,detail="Dedicated resident is unavailable") from exc
+            value.update(resident_pid=_dedicated_backend.pid,model_run_id=os.environ["MODEL_RUN_ID"])
     return value
 
 
@@ -175,10 +182,14 @@ def _gateway_seed(round_index: int, node_id: str) -> int:
     return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big") & ((1 << 63) - 1)
 
 
-def _get_dedicated_backend() -> DedicatedModel:
+def _get_dedicated_backend():
     global _dedicated_backend
     with _model_lock:
         if _dedicated_backend is None:
+            from .resident import ResidentClient
+            if ResidentClient.ENV & set(os.environ):
+                _dedicated_backend=ResidentClient(os.environ,NODE_ID)
+                return _dedicated_backend
             _dedicated_backend = DedicatedModel(
                 node_id=NODE_ID, run_id=os.environ["MODEL_RUN_ID"], model_name=MODEL_NAME,
                 cache_dir=os.environ["MODEL_CACHE_DIR"], quantization=os.getenv("MODEL_QUANTIZATION", "nf4"),
@@ -189,59 +200,102 @@ def _get_dedicated_backend() -> DedicatedModel:
         return _dedicated_backend
 
 
-async def _raw_dedicated(request: InferRequest) -> dict:
-    return await asyncio.to_thread(_get_dedicated_backend().generate, round_index=request.round_index,
+async def _raw_dedicated(request: InferRequest, *, logged_only=False) -> dict:
+    backend = _get_dedicated_backend()
+    action = backend.read_generation if logged_only else backend.generate
+    return await asyncio.to_thread(action, round_index=request.round_index,
                                    task_id=request.task_id, question=request.question,
                                    seed=_gateway_seed(request.round_index, NODE_ID))
 
 
 class ModelAnswerRequest(InferRequest):
+    model_config = ConfigDict(extra="forbid")
+    round_index: StrictInt
     run_id: str
     node_id: str
 
 
-@app.post("/model_answer")
-async def model_answer(request: ModelAnswerRequest) -> dict:
-    """Raw local generation used only to coordinate the experimental collusion."""
+def _dedicated_request_identity(request: ModelAnswerRequest, http: Request) -> None:
     if INFERENCE_MODE != "model" or not os.getenv("MODEL_RUN_ID"):
         raise HTTPException(status_code=404, detail="Dedicated model disabled")
     if request.run_id != os.environ["MODEL_RUN_ID"] or request.node_id != NODE_ID:
         raise HTTPException(status_code=409, detail="Model request belongs to another scenario or node")
+    if _noise_policy == "incremental_upward":
+        _require_checkpoint_channel(http)
+        r = request.round_index
+        if not 0 <= r < len(_incremental_task_pins) or request.expected is not None:
+            raise HTTPException(status_code=422, detail="Round outside current incremental case")
+        expected = [request.task_id, hashlib.sha256(request.question.encode("utf-8")).hexdigest()]
+        if _incremental_task_pins[r] != expected:
+            raise HTTPException(status_code=409, detail="Incremental query differs from the assigned task")
+
+
+@app.post("/generation_ready")
+async def generation_ready(request: ModelAnswerRequest, http: Request) -> dict:
+    """Record this node's own generation; reply only with the bound acknowledgement."""
+    if _noise_policy != "incremental_upward":
+        raise HTTPException(status_code=404, detail="Incremental generation disabled")
+    _dedicated_request_identity(request, http)
     try:
+        await _raw_dedicated(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"run_id": request.run_id, "node_id": NODE_ID, "round_index": request.round_index,
+            "task_id": request.task_id, "generated": True}
+
+
+@app.post("/model_answer")
+async def model_answer(request: ModelAnswerRequest, http: Request) -> dict:
+    """Read a numeric candidate from this node for same-round collusion."""
+    _dedicated_request_identity(request, http)
+    try:
+        if _noise_policy == "incremental_upward":
+            raw = await _raw_dedicated(request, logged_only=True)
+            return {"node_id": NODE_ID, "run_id": request.run_id, "answer": raw["answer"]}
         return {"node_id": NODE_ID, "run_id": request.run_id, **await _raw_dedicated(request)}
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 async def _dedicated_inference(request: InferRequest) -> tuple[Optional[Answer], int]:
-    # Every participant, including each malicious participant, calls its OWN
-    # resident model before applying the experimental attack transformation.
-    raw = await _raw_dedicated(request)
+    # The incremental coordinator first barriers 20 actual durable model calls.
+    # Re-reading the same node/task/seed/current round is not another model call.
+    incremental = _noise_policy == "incremental_upward"
+    raw = await _raw_dedicated(request, logged_only=True) if incremental else await _raw_dedicated(request)
     answer, latency, base_id = normalize(raw["answer"]), int(raw["latency_ms"]), NODE_ID
+
+    async def peer_answer(peer_id):
+        response = await _http().post(f"{_node_url(peer_id)}/model_answer", json={
+            "run_id": os.environ["MODEL_RUN_ID"], "node_id": peer_id,
+            "round_index": request.round_index, "task_id": request.task_id, "question": request.question},
+            **({"headers": _checkpoint_headers()} if incremental else {}))
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("node_id") != peer_id or payload.get("run_id") != os.environ["MODEL_RUN_ID"]:
+            raise ValueError("Collusion base belongs to another node or scenario")
+        return normalize(payload["answer"])
+
     if PROFILE == behavior.MALICIOUS and not malicious_acts_honest(request.round_index, _protocol):
-        base_id = min(COLLUDERS, key=node_sort_key) if COLLUDERS else NODE_ID
-        base = answer
-        if base_id != NODE_ID:
-            response = await _http().post(f"{_node_url(base_id)}/model_answer", json={
-                "run_id": os.environ["MODEL_RUN_ID"], "node_id": base_id,
-                "round_index": request.round_index, "task_id": request.task_id, "question": request.question})
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("node_id") != base_id or payload.get("run_id") != os.environ["MODEL_RUN_ID"]:
-                raise ValueError("Collusion base belongs to another node or scenario")
-            base = normalize(payload["answer"])
-        rng = random.Random(f"{int(os.getenv('EXPERIMENT_SEED', '0'))}:{request.round_index}:noise")
-        noise_mode = os.getenv("NOISE_MODE", "relative")
-        if noise_mode == "relative":
-            answer = behavior.corrupt_relative(base, rng, float(os.getenv("NOISE_DISTANCE", "0.2")))
-        elif noise_mode == "multiplicative":
-            answer = behavior.corrupt_with_noise(base, rng)
+        experiment_seed = int(os.getenv("EXPERIMENT_SEED", "0"))
+        if incremental:
+            answer, base_id = await incremental_output(
+                node_id=NODE_ID, own_answer=answer, colluders=COLLUDERS, collusion=_incremental_collusion,
+                seed=experiment_seed, round_index=request.round_index, read_peer=peer_answer)
         else:
-            raise ValueError("Modo de ruído inválido.")
+            base_id = min(COLLUDERS, key=node_sort_key) if COLLUDERS else NODE_ID
+            base = answer if base_id == NODE_ID else await peer_answer(base_id)
+            rng = random.Random(f"{experiment_seed}:{request.round_index}:noise")
+            noise_mode = os.getenv("NOISE_MODE", "relative")
+            if noise_mode == "relative":
+                answer = behavior.corrupt_relative(base, rng, float(os.getenv("NOISE_DISTANCE", "0.2")))
+            elif noise_mode == "multiplicative":
+                answer = behavior.corrupt_with_noise(base, rng)
+            else:
+                raise ValueError("Modo de ruído inválido.")
     if request.round_index in _campaign_absences:
-        if PROFILE != behavior.MALICIOUS:
+        if PROFILE != behavior.MALICIOUS and not incremental:
             raise ValueError("Campaign can suppress only configured colluders")
-        answer = None  # Raw fresh generation already durable; this is a submission omission.
+        answer = None  # This node already recorded a generation. No submitted answer.
     await asyncio.to_thread(_get_dedicated_backend().record_response, request.round_index, answer, base_id)
     return answer, latency
 
@@ -352,6 +406,19 @@ _audited = plan_audits(int(os.getenv("EXPERIMENT_SEED", "0")), _rounds, _test_ev
 if "AUDIT_ROUNDS_OVERRIDE" in os.environ:
     _audited = frozenset(json.loads(os.environ["AUDIT_ROUNDS_OVERRIDE"]))
 _campaign_absences = frozenset(json.loads(os.getenv("N20_SIMULATED_ABSENCES", "[]")))
+_noise_policy = os.getenv("N20_NOISE_POLICY", "legacy")
+_incremental_flag = os.getenv("N20_COLLUSION")
+if (_noise_policy not in ("legacy", "incremental_upward")
+        or (_noise_policy == "incremental_upward" and
+            (_incremental_flag not in ("0", "1") or "AUDIT_ROUNDS_OVERRIDE" not in os.environ
+             or os.getenv("N20_EXPLICIT_AUDIT_SCHEDULE") != "1"))):
+    raise ValueError("Invalid incremental node configuration")
+_incremental_collusion = _incremental_flag == "1"
+_incremental_task_pins = json.loads(os.getenv("N20_INCREMENTAL_TASK_PINS", "[]"))
+if _noise_policy == "incremental_upward" and (len(_incremental_task_pins) != _rounds or
+        any(not isinstance(x, list) or len(x) != 2 or not all(isinstance(k, str) for k in x)
+            for x in _incremental_task_pins)):
+    raise ValueError("Missing exact incremental task pin list")
 _protocol = ProtocolConfig(
     signal=os.getenv("SIGNAL", "hybrid"),
     alpha=float(os.getenv("ALPHA", "0.3")),
@@ -366,6 +433,7 @@ _protocol = ProtocolConfig(
     honest_rounds=int(os.getenv("HONEST_ROUNDS", "5")),
     audit_mode=_audit_mode,
     audited_rounds=_audited,
+    explicit_audit_schedule=os.getenv("N20_EXPLICIT_AUDIT_SCHEDULE") == "1",
     alpha_up=float(os.getenv("ALPHA_UP", "0.1")),
     defense=with_overrides(
         replace(defense_preset(os.getenv("DEFENSE", "all")),
@@ -622,9 +690,12 @@ async def state() -> dict:
     return _require_replica().snapshot()
 
 
-@app.get("/checkpoint-state")
-async def checkpoint_state(request: Request, round_index: int) -> dict:
-    """Read one replica at the coordinator fence; never restore via this endpoint."""
+def _checkpoint_headers():
+    return {"X-N20-Checkpoint-Token": os.environ["N20_CHECKPOINT_TOKEN"],
+            "X-N20-Checkpoint-Run": os.environ["N20_CHECKPOINT_RUN_ID"]}
+
+
+def _require_checkpoint_channel(request: Request) -> None:
     token = os.getenv("N20_CHECKPOINT_TOKEN")
     run_id = os.getenv("N20_CHECKPOINT_RUN_ID")
     provided = request.headers.get("X-N20-Checkpoint-Token", "")
@@ -632,6 +703,12 @@ async def checkpoint_state(request: Request, round_index: int) -> dict:
     if (not token or not run_id or not request.client or request.client.host not in {"127.0.0.1","::1"}
         or not provided.isascii() or not hmac.compare_digest(token,provided) or presented_run != run_id):
         raise HTTPException(status_code=404)
+
+
+@app.get("/checkpoint-state")
+async def checkpoint_state(request: Request, round_index: int) -> dict:
+    """Read one replica at the coordinator fence; never restore via this endpoint."""
+    _require_checkpoint_channel(request)
     replica = _require_replica()
     if replica.state.trace_round != round_index:
         raise HTTPException(status_code=409,detail="Replica not at requested completed boundary")

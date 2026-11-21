@@ -17,7 +17,7 @@ import time
 class DedicatedModel:
     def __init__(self, *, node_id, run_id, model_name, cache_dir, quantization="nf4",
                  device="cuda", revision=None, max_new_tokens=256, temperature=.7,
-                 top_p=.95, factory=None, dtype=None):
+                 top_p=.95, factory=None, dtype=None, resident_model=None):
         dtype = dtype or {"nf4": "float16", "none": "bfloat16"}.get(quantization)
         if device != "cuda" or (quantization, dtype) not in (("nf4", "float16"), ("none", "bfloat16")):
             raise ValueError("Dedicated CUDA inference requires NF4/float16 or unquantized bfloat16")
@@ -26,8 +26,11 @@ class DedicatedModel:
         self.dtype = dtype
         self.max_new_tokens, self.temperature, self.top_p = max_new_tokens, temperature, top_p
         self.lock = threading.RLock()
-        self.model = None
+        if factory is not None and resident_model is not None:
+            raise ValueError("A real resident model cannot use the test factory")
+        self.model = resident_model
         self.factory = factory
+        self._runtime_written = False
         self.path = Path(cache_dir) / "inferencias.sqlite"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         identity = {"run_id": run_id, "node_id": node_id, "model": model_name,
@@ -64,8 +67,9 @@ class DedicatedModel:
                                               dtype=self.dtype)
                 else:
                     self.model = self.factory()
-                if self.factory is None:
-                    self._record_memory()
+            if self.factory is None and not self._runtime_written:
+                self._record_memory()
+                self._runtime_written=True
             return self.model
 
     def _record_memory(self):
@@ -115,6 +119,20 @@ class DedicatedModel:
                        (round_index, self.node_id, task_id, digest, seed, json.dumps(answer), text, latency))
             db.commit()
             return {"answer": answer, "text": text, "latency_ms": latency}
+
+    def read_generation(self, *, round_index, task_id, question, seed):
+        """Read an already logged generation; never create a physical model call."""
+        if isinstance(round_index, bool) or round_index < 0:
+            raise ValueError("Invalid round index")
+        digest = hashlib.sha256(question.encode("utf-8")).hexdigest()
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT node_id,task_id,question_hash,seed,answer,text,latency_ms "
+                "FROM generations WHERE round_index=?", (round_index,),
+            ).fetchone()
+        if not row or row[:4] != (self.node_id, task_id, digest, seed):
+            raise ValueError("Own round generation is not durably logged for this question/seed")
+        return {"answer": json.loads(row[4]), "text": row[5], "latency_ms": row[6]}
 
     def record_response(self, round_index, answer, base_node):
         with self.lock, closing(self._connect()) as db:

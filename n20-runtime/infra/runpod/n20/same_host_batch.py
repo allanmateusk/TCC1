@@ -111,6 +111,14 @@ class SameHostBatch:
                     "nodes":20,"rounds":50,"seed":0,"deadline":cutoff,
                     "git_sha":self.plan.git_sha,"profile_sha256":self.plan.profile_sha256}
 
+    def require_active_case(self,now,run_id,*,trusted: Resource):
+        if not isinstance(trusted,Resource):
+            raise ValueError("Independent resource observation is required")
+        with self._tx(now,trusted=trusted) as (_,reason,active):
+            allowed=not reason and bool(active) and active["run_id"]==run_id and now < active["cutoff"]
+        if not allowed:
+            raise InterruptedError("The protected same-host controller no longer authorizes this case")
+
     def seal(self,now,run_id,*,sha256,size):
         if not _hex(sha256,64) or type(size) is not int or not 0<size<=64*1024**2:
             raise ValueError("Invalid pre-upload evidence")

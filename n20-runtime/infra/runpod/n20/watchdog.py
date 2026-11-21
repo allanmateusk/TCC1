@@ -11,7 +11,7 @@ import os
 import re
 import tempfile
 
-from .campaign import IDS
+from . import campaign_profiles
 
 
 @dataclass(frozen=True)
@@ -26,10 +26,19 @@ class Binding:
     max_attempts: int = 5
     run_kind: str = "pilot"
     scenario_id: str = "pilot"
+    campaign_id: str | None = None
+    profile_sha256: str | None = None
+
+    def scope(self):
+        return campaign_profiles.fields(self.campaign_id,self.profile_sha256)
+
+    def serialized(self):
+        return {**{k:v for k,v in vars(self).items() if k not in campaign_profiles.FIELDS},**self.scope()}
 
     def __post_init__(self):
-        if not ((self.run_kind == "pilot" and self.scenario_id == "pilot") or
-                (self.run_kind == "official" and self.scenario_id in IDS)):
+        if (self.run_kind not in ("pilot","official")
+                or (self.run_kind=="pilot")!=(self.scenario_id=="pilot")
+                or not campaign_profiles.verify_identity(self.scenario_id,self.rounds,self.campaign_id,self.profile_sha256)):
             raise ValueError("Unknown phase or mismatched scenario")
         if not re.fullmatch(r"[0-9a-f]{32}", self.run_id):
             raise ValueError("Invalid pilot run ID")
@@ -46,6 +55,8 @@ class Binding:
 
     @property
     def key(self):
+        if self.scope():
+            return campaign_profiles.candidate_key(self.run_id)
         prefix = "piloto" if self.run_kind == "pilot" else "prod"
         return f"tcc/{prefix}/n20-{self.run_id}.zip"
 
@@ -82,11 +93,15 @@ class State:
     def load(cls, path: Path):
         with path.open(encoding="utf-8") as stream:
             value = json.load(stream)
-        return cls(binding=Binding(**value.pop("binding")), **value)
+        raw=value.pop("binding")
+        binding=Binding(**raw)
+        if not campaign_profiles.matches_record(raw,binding.scope()):
+            raise ValueError("Unrecognized campaign identity in watchdog state")
+        return cls(binding=binding, **value)
 
     def persist(self, path: Path, *, arm: bool = False):
         """Controller-owned file. Use an exclusive scheduler lock for serial ticks."""
-        value = {**vars(self), "binding": vars(self.binding)}
+        value = {**vars(self), "binding": self.binding.serialized()}
         fd, name = tempfile.mkstemp(prefix=".watchdog-", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -108,7 +123,8 @@ def arm(path: Path, binding: Binding):
     return state
 
 
-def require_armed(path: Path, now: float, *, run_id: str, run_kind: str, scenario_id: str):
+def require_armed(path: Path, now: float, *, run_id: str, run_kind: str, scenario_id: str,
+                  campaign_id=None, profile_sha256=None):
     """Validate the exact run against independently protected, read-only state.
 
     This attests a valid binding, not that a scheduler or provider is live.
@@ -118,7 +134,8 @@ def require_armed(path: Path, now: float, *, run_id: str, run_kind: str, scenari
         raise ValueError("Missing independently armed state")
     state = State.load(path)
     b = state.binding
-    if (run_id, run_kind, scenario_id) != (b.run_id, b.run_kind, b.scenario_id):
+    if ((run_id, run_kind, scenario_id) != (b.run_id, b.run_kind, b.scenario_id)
+            or b.scope()!=campaign_profiles.fields(campaign_id,profile_sha256)):
         raise ValueError("Armed binding does not match this run, phase and scenario")
     if (not math.isfinite(now) or not b.armed_at <= now < min(b.deadline, state.last_seen + b.stale_after)
             or state.reason or state.attempts or state.verified_phase):
@@ -132,6 +149,8 @@ def matches_receipt(binding: Binding, receipt: dict | None) -> bool:
     return (
         receipt.get("schema") == "tcc-n20-r2-receipt/v1"
         and receipt.get("status") == "verified"
+        and not binding.scope()
+        and campaign_profiles.matches_record(receipt,binding.scope())
         and receipt.get("run_id") == binding.run_id
         and receipt.get("run_kind") == binding.run_kind
         and receipt.get("scenario_id") == binding.scenario_id
@@ -148,10 +167,10 @@ def evaluate(binding: Binding, state: State, now: float, *,
              local: dict | None, receipt: dict | None, heartbeat: dict | None, cancel: bool):
     if not math.isfinite(now) or now < binding.armed_at:
         raise ValueError("Invalid controller clock")
-    local = local if isinstance(local, dict) and (
+    local = local if campaign_profiles.matches_record(local,binding.scope()) and (
         local.get("run_id"), local.get("run_kind"), local.get("scenario_id")
     ) == (binding.run_id, binding.run_kind, binding.scenario_id) else {}
-    heartbeat = heartbeat.get("heartbeat_at_epoch") if isinstance(heartbeat, dict) and heartbeat.get("run_id") == binding.run_id else None
+    heartbeat = heartbeat.get("heartbeat_at_epoch") if campaign_profiles.matches_record(heartbeat,binding.scope()) and heartbeat.get("run_id") == binding.run_id else None
     if type(heartbeat) in (int, float) and binding.armed_at <= heartbeat <= now:
         state.last_seen = max(state.last_seen, heartbeat)
     if state.reason:
@@ -174,6 +193,8 @@ def tick(path: Path, now: float, *, local=None, receipt=None, heartbeat=None, ca
     """One externally scheduled tick. No provider operation or file update unless apply=True."""
     state = State.load(path)
     b = state.binding
+    if apply and b.scope():
+        raise ValueError("Incremental watchdog is candidate-only; provider actions disabled")
     reason = evaluate(b, state, now, local=local, receipt=receipt, heartbeat=heartbeat, cancel=cancel)
     if not apply:
         return {"status": "dry-run", "reason": reason, "resource_id": b.resource_id}

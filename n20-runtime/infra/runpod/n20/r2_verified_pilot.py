@@ -15,6 +15,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from zipfile import BadZipFile
 
 from . import artifact_store as store
+from . import campaign_profiles
 from . import r2_grants as transport
 
 KEYS = re.compile(r"tcc/(?:piloto|prod)/n20-[0-9a-f]{32}\.zip\Z")
@@ -45,9 +46,11 @@ def object_key(run_id, kind="pilot"):
 
 def prepare(root, run_id):
     manifest = store.read_file(root,store.MANIFEST)
-    phase = json.loads(manifest).get("run_kind")
-    key = object_key(run_id,phase)
-    path = root / (store.ARCHIVE if phase=="pilot" else store.OFFICIAL_ARCHIVE)
+    identity = json.loads(manifest)
+    phase = identity.get("run_kind")
+    scope = campaign_profiles.scope(campaign_profiles.select_for_record(identity))
+    key = campaign_profiles.candidate_key(run_id) if scope else object_key(run_id,phase)
+    path = root / (store.CANDIDATE_ARCHIVE if scope else store.ARCHIVE if phase=="pilot" else store.OFFICIAL_ARCHIVE)
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file() or path.stat().st_size > store.MAX_ZIP:
             raise ValueError("Unsafe staged ZIP")
@@ -105,6 +108,9 @@ def _request(open_url, request, deadline, clock, *, size):
 
 def upload(root, run_id, config, put_url, get_url, *, opener=None, now=None,
            clock=time.monotonic, sleep=time.sleep):
+    identity = json.loads(store.read_file(root,store.MANIFEST))
+    if campaign_profiles.scope(campaign_profiles.select_for_record(identity)):
+        raise TransferError("Incremental campaign is not qualified for any R2 transfer")
     data, key = prepare(root, run_id)
     metrics = store.verify_archive(data, run_id)
     transport.validate_config(config,metrics["run_kind"])
@@ -175,11 +181,16 @@ def main():
         root = store.durable_run(args.durable_root,args.run_id,repo=Path(__file__).resolve().parents[4])
         if args.operation=="prepare":
             data,key = prepare(root,args.run_id)
-            result = {"status":"prepared_local","run_id":args.run_id,"bucket":transport.BUCKET,
-                      "key":key,"bytes":len(data),"sha256":store.sha(data)}
+            identity=json.loads(store.read_file(root,store.MANIFEST))
+            scope=campaign_profiles.scope(campaign_profiles.select_for_record(identity))
+            result = {"status":"prepared_candidate_local_no_transfer" if scope else "prepared_local",
+                      "run_id":args.run_id,"bucket":transport.BUCKET,"key":key,"bytes":len(data),
+                      "sha256":store.sha(data),**scope}
         else:
-            phase = json.loads(store.read_file(root,store.MANIFEST)).get("run_kind")
-            cfg = transport.load_config(phase)
+            identity=json.loads(store.read_file(root,store.MANIFEST))
+            if campaign_profiles.scope(campaign_profiles.select_for_record(identity)):
+                raise TransferError("Incremental campaign is not qualified for any R2 transfer")
+            cfg = transport.load_config(identity.get("run_kind"))
             result = upload(root,args.run_id,cfg,os.environ.pop(PUT_ENV,None),os.environ.pop(GET_ENV,None))
         print(json.dumps(result,sort_keys=True))
     except TransferError as exc:

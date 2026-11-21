@@ -46,7 +46,7 @@ def _digest(data):
 
 def _config(raw, identity):
     cfg = yaml.safe_load(raw)
-    if cfg["checkpoint_identity"] != asdict(identity):
+    if cfg["checkpoint_identity"] != identity.serialized():
         raise ValueError("Effective config keeps a different checkpoint identity")
     core = {k:v for k,v in cfg.items() if k != "checkpoint_identity"}
     if _digest(json_bytes(core)) != identity.config_sha256:
@@ -195,7 +195,7 @@ class RoundReplication:
 
     def _proof(self,number,data,marker):
         return {"schema":SCHEMA, "key":self.key(number),"round":number,"nodes":20,
-                "identity":asdict(self.identity),"bytes":len(data),"sha256":_digest(data),"checkpoint_sha256":marker}
+                "identity":self.identity.serialized(),"bytes":len(data),"sha256":_digest(data),"checkpoint_sha256":marker}
 
     def _receipt(self,number):
         path=self._local(number,"receipt.json")
@@ -206,7 +206,7 @@ class RoundReplication:
         for i in range(1,6):
             item=self._receipt(i)
             if item is None: break
-            if (item.get("schema")!=SCHEMA or item.get("identity")!=asdict(self.identity)
+            if (item.get("schema")!=SCHEMA or item.get("identity")!=self.identity.serialized()
                 or item.get("key")!=self.key(i) or item.get("round")!=i or item.get("nodes")!=20
                 or not re.fullmatch("[0-9a-f]{64}",item.get("sha256",""))):
                 raise ValueError("Invalid protected replication receipt")

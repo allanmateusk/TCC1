@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 import json
 import os
 from pathlib import Path
@@ -89,9 +90,9 @@ async def _get(client: httpx.AsyncClient, url: str, timeout: float, **params) ->
         return None
 
 
-async def _post(client: httpx.AsyncClient, url: str, payload: dict, timeout: float) -> Optional[dict]:
+async def _post(client: httpx.AsyncClient, url: str, payload: dict, timeout: float, *, headers=None) -> Optional[dict]:
     try:
-        response = await client.post(url, json=payload, timeout=timeout)
+        response = await client.post(url, json=payload, timeout=timeout, **({"headers": headers} if headers else {}))
         response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError):
@@ -119,6 +120,7 @@ def _protocol_config(config: dict) -> ProtocolConfig:
         honest_rounds=int(config.get("honest_rounds", 5)),
         audit_mode=audit_mode,
         audited_rounds=audited,
+        explicit_audit_schedule=config.get("explicit_audit_schedule", False),
         alpha_up=float(config.get("alpha_up", 0.1)),
         defense=with_overrides(
             replace(defense_preset(config.get("defense", "all")),
@@ -128,6 +130,31 @@ def _protocol_config(config: dict) -> ProtocolConfig:
             oracle_alpha=config.get("oracle_alpha"),
         ),
     )
+
+
+async def _prime_incremental_generations(client, urls, node_ids, round_index, task, config, timeout):
+    """Barrier: the 20 current-round generations are durable before leader/task submission."""
+    import re
+    run_id = (config.get("checkpoint_identity") or {}).get("run_id")
+    if not isinstance(run_id, str) or re.fullmatch(r"[a-f0-9]{32}", run_id) is None:
+        raise ValueError("Incremental generation requires a bound current run UUID")
+    token = os.getenv("N20_CHECKPOINT_TOKEN")
+    if not token or os.getenv("N20_CHECKPOINT_RUN_ID") != run_id:
+        raise ValueError("Missing incremental generation control authorization")
+    headers = {"X-N20-Checkpoint-Token": token, "X-N20-Checkpoint-Run": run_id}
+    if len(node_ids) != 20 or len(set(node_ids)) != 20:
+        raise ValueError("Incremental generation barrier requires twenty distinct nodes")
+    expected = [
+        {"run_id": run_id, "node_id": n, "round_index": round_index, "task_id": task["id"]}
+        for n in node_ids
+    ]
+    received = await asyncio.gather(*(
+        _post(client, f"{urls[item['node_id']]}/generation_ready", {**item, "question": task["question"]},
+              timeout, headers=headers)
+        for item in expected
+    ))
+    if any(value != {**item, "generated": True} for item, value in zip(expected, received, strict=True)):
+        raise RuntimeError("Not every node has verified its own durable generation; round was not submitted")
 
 
 def _groups_by_head(states: dict[str, dict]) -> dict[str, list[str]]:
@@ -224,6 +251,13 @@ async def run_dynamic_experiment(config: dict, *, resume_marker=None) -> dict:
                          "planned": oracle_round(round_index, cfg),
                          "preempted": bool(campaign and round_index + 1 in campaign["preempted_rounds"]),
                          "genesis": genesis, "oracle_by_node": {}, "simulated_absences": []}
+                if config.get("noise_policy") == "incremental_upward":
+                    if not strict_inference or genesis:
+                        raise ValueError("Incremental generation barrier is dedicated only and does not use genesis")
+                    barrier_start = time.monotonic()
+                    await _prime_incremental_generations(client, urls, node_ids, round_index, task, config, timeout)
+                    event["generation_barrier_nodes"] = len(node_ids)
+                    event["generation_barrier_ms"] = int((time.monotonic() - barrier_start) * 1000)
                 if genesis:
                     if len(groups) != 1:
                         raise RuntimeError("Genesis requires a single common chain")

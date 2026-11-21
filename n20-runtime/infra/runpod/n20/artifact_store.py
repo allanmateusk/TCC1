@@ -25,6 +25,7 @@ MAX_FILE = 1024 * 1024
 MAX_ZIP = 6 * 1024 * 1024
 ARCHIVE = "r2-pilot.zip"
 OFFICIAL_ARCHIVE = "r2-official.zip"
+CANDIDATE_ARCHIVE = "r2-candidate-incremental-v1.zip"
 DOWNLOADED = "r2-downloaded.zip"
 RECEIPT = "r2-verified.json"
 SENSITIVE = re.compile(
@@ -115,22 +116,27 @@ def _csv(raw):
 
 
 def _definition(m):
-    from . import campaign
-    profile = json.loads(Path(__file__).with_name("profile.json").read_text(encoding="utf-8"))
-    scenarios = {row["id"]: row for row in (*profile["scenarios"], profile["pilot"])}
+    from . import campaign_profiles
+    profile = campaign_profiles.select_for_record(m)
+    scope = campaign_profiles.scope(profile)
+    scenarios = {row["id"]: row for row in profile["scenarios"]}
+    if "pilot" in profile:
+        scenarios["pilot"]=profile["pilot"]
+    if scope and (m.get("profile")!=profile or not campaign_profiles.matches_record(m.get("scenario"),scope)):
+        raise ValueError("Archived candidate profile or scenario lacks the frozen campaign binding")
     tag = m.get("scenario_id")
     kind = "pilot" if tag=="pilot" else "official"
     n_rounds = 5 if kind=="pilot" else 50
     if tag not in scenarios or m.get("run_kind") != kind or m.get("rounds") != n_rounds:
         raise ValueError("Unknown or inconsistent campaign phase and scenario")
     row = scenarios[tag]
-    expected = campaign.plan(profile,row,0,n_rounds)
+    expected = campaign_profiles.plan(profile,row,0,n_rounds)
     actual = m.get("scenario",{}).get("audit_plan",{})
     if json.loads(json.dumps(expected)) != json.loads(json.dumps(actual)):
         raise ValueError("Archived audit/absence plan differs from the pinned campaign")
     if m.get("scenario",{}).get("nota") != row.get("score",profile["protocol"]["score"]):
         raise ValueError("Archived grading rule differs from scenario")
-    expid = f"{'pilot' if kind=='pilot' else 'live'}-n20-r{n_rounds}-{tag}-s0"
+    expid = campaign_profiles.experiment_id(profile,tag,0,n_rounds)
     if m.get("experiment_id") != expid or m.get("scenario",{}).get("id") != expid:
         raise ValueError("Wrong experiment identity")
     path = Path(__file__).resolve().parents[3] / profile["task_file"]
@@ -138,6 +144,10 @@ def _definition(m):
     if sha(raw) != profile["task_sha256"]:
         raise ValueError("Pinned task digest differs")
     task_ids = [entry["id"] for entry in json.loads(raw)["tarefas"]][:n_rounds]
+    if scope:
+        if any(m["scenario"].get(k)!=row[k] for k in ("collusion","unstable_nodes")):
+            raise ValueError("Archived candidate collusion/instability diverges from the frozen scenario")
+        row = {"mechanism":profile["protocol"]["mechanism"],**row}
     return row, expected, n_rounds, task_ids
 
 
@@ -275,7 +285,9 @@ def validate_files(files, run_id):
             or runtime["peak_reserved_bytes"] <= 0 or type(runtime.get("kv_cache")) is not bool
         ):
             raise ValueError("Node runtime does not prove actual BF16 loading")
-    return {"run_kind":m["run_kind"],"scenario_id":m["scenario_id"],"rounds":n_rounds,"nodes":20,
+    scope = {k:m[k] for k in ("campaign_id","profile_sha256") if k in m}
+    # No qualification claim for a candidate archive; this is offline evidence only.
+    return {"run_kind":m["run_kind"],"scenario_id":m["scenario_id"],"rounds":n_rounds,"nodes":20,**scope,
             "verified_own_generations":20*n_rounds,"verified_ledgers":20,"verified_quorum_rounds":len(routine),
             "verified_audit_rounds":sorted(audits),"verified_genesis_rounds":sorted(genesis),
             "verified_intentional_absences":len(omissions)}

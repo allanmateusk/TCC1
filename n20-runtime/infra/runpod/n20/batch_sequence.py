@@ -35,8 +35,12 @@ class BatchPlan:
             or type(self.max_attempt_seconds) is not int or not 1 <= self.max_attempt_seconds <= 7200):
             raise ValueError("Missing identity or invalid batch deadline")
 
+    @property
+    def case_ids(self):
+        return IDS
+
     def serialized(self):
-        return json.dumps({**asdict(self), "scenarios": IDS, "run_kind": "official",
+        return json.dumps({**asdict(self), "scenarios": self.case_ids, "run_kind": "official",
                            "seed": 0, "nodes": 20, "rounds": 50},
                           sort_keys=True, allow_nan=False)
 
@@ -76,16 +80,15 @@ class Sequencer:
             if not old:
                 db.execute("INSERT INTO batch(singleton,plan,last_now) VALUES (1,?,?)",
                            (self.plan.serialized(), self.plan.opened_at))
-                db.executemany("INSERT INTO cases(idx,scenario) VALUES (?,?)", enumerate(IDS))
+                db.executemany("INSERT INTO cases(idx,scenario) VALUES (?,?)", enumerate(self.plan.case_ids))
             elif old["plan"] != self.plan.serialized():
                 raise ValueError("Stored plan differs; do not reuse this batch database")
             self._check_cases(db)
             db.commit()
 
-    @staticmethod
-    def _check_cases(db):
+    def _check_cases(self,db):
         rows = db.execute("SELECT idx,scenario,status FROM cases ORDER BY idx").fetchall()
-        if [(r["idx"], r["scenario"]) for r in rows] != list(enumerate(IDS)):
+        if [(r["idx"], r["scenario"]) for r in rows] != list(enumerate(self.plan.case_ids)):
             raise ValueError("Stored case order differs from campaign")
         statuses = [r["status"] for r in rows]
         if any(x not in ("pending", "active", "complete") for x in statuses):

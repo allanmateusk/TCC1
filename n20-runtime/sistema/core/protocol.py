@@ -76,6 +76,7 @@ class ProtocolConfig:
     alpha_up: float = 0.1
     validation_score: str = "graded"
     consensus_center: str = "medoid"
+    explicit_audit_schedule: bool = False
 
     def __post_init__(self) -> None:
         if self.signal not in SIGNALS:
@@ -90,6 +91,8 @@ class ProtocolConfig:
             raise ValueError(f"validation_score deve ser um de {VALIDATION_SCORES!r}.")
         if self.consensus_center not in CONSENSUS_CENTERS:
             raise ValueError(f"consensus_center deve ser um de {CONSENSUS_CENTERS!r}.")
+        if type(self.explicit_audit_schedule) is not bool:
+            raise ValueError("Invalid explicit audit schedule switch")
         object.__setattr__(self, "audited_rounds", frozenset(self.audited_rounds))
 
     @property
@@ -223,7 +226,7 @@ def malicious_acts_honest(round_index: int, config: ProtocolConfig) -> bool:
 
 def oracle_round(round_index: int, config: ProtocolConfig) -> bool:
     """Indica se o juiz do experimento corrige esta rodada pelo gabarito."""
-    if config.audit_mode == "random":
+    if config.explicit_audit_schedule or config.audit_mode == "random":
         return round_index in config.audited_rounds
     if config.signal == "consensus":
         return False

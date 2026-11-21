@@ -11,7 +11,7 @@ from sistema.core.protocol import apply_record
 from sistema.core.replica import Replica
 
 from .artifact_store import json_bytes, write_atomic
-from .campaign import IDS
+from . import campaign_profiles
 
 
 NODES = frozenset(f"node-{i}" for i in range(20))
@@ -38,13 +38,21 @@ class Identity:
     config_sha256: str
     tasks_sha256: str
     audit_sha256: str
+    campaign_id: str | None = None
+    profile_sha256: str | None = None
+
+    def serialized(self):
+        data=asdict(self)
+        if self.campaign_id is None:
+            for k in campaign_profiles.FIELDS:
+                data.pop(k)
+        return data
 
     def __post_init__(self):
         if (not _hex(self.run_id, 32) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.experiment_id)
             or type(self.seed) is not int or self.seed != 0
             or type(self.rounds) is not int
-            or not ((self.scenario_id == "pilot" and self.rounds == 5)
-                    or (self.scenario_id in IDS and self.rounds == 50))
+            or not campaign_profiles.verify_identity(self.scenario_id,self.rounds,self.campaign_id,self.profile_sha256)
             or not all(_hex(x, 40) for x in (self.git_sha, self.model_revision))
             or not all(_hex(x, 64) for x in (self.config_sha256, self.tasks_sha256, self.audit_sha256))):
             raise ValueError("Unbound or invalid checkpoint identity")
@@ -113,7 +121,7 @@ class CheckpointStore:
         return self.root / f"checkpoint-{i:02d}.json"
 
     def _verify(self, content, i, digest, prior):
-        if (content.get("schema") != SCHEMA or content.get("identity") != asdict(self.identity)
+        if (content.get("schema") != SCHEMA or content.get("identity") != self.identity.serialized()
             or type(content.get("round_index")) is not int or content["round_index"] != i
             or content.get("previous") != digest or set(content.get("replicas", {})) != NODES
             or set(content.get("log_prefixes", {})) != LOGS
@@ -160,7 +168,7 @@ class CheckpointStore:
         # process always scans the immutable chain independently.
         prior, prev_digest = self._writer_frontier or self.recover()
         i = 0 if prior is None else prior["round_index"] + 1
-        value = dict(schema=SCHEMA, identity=asdict(self.identity), round_index=round_index,
+        value = dict(schema=SCHEMA, identity=self.identity.serialized(), round_index=round_index,
                      previous=prev_digest if round_index == i else (prior or {}).get("previous"),
                      replicas=replicas, groups=groups, next_gid=next_gid, log_prefixes=log_prefixes)
         if type(round_index) is not int or not 0 <= round_index < self.identity.rounds:

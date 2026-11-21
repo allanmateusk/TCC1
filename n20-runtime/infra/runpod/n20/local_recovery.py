@@ -73,7 +73,7 @@ def prepare(work, identity, tasks, expected_model_scope, *, accepted_digest):
             expected_seed = int.from_bytes(hashlib.sha256(f"{identity.seed}:{r}:{node}".encode()).digest()[:8], "big") & (2**63-1)
             if (n, task_id, question_hash, seed) != (node, task["id"], a.sha(task["question"].encode()), expected_seed):
                 raise ValueError("Question, seed or node changed in recovery")
-    return {"identity":asdict(identity), "index":index, "digest":digest}, marker
+    return {"identity":identity.serialized(), "index":index, "digest":digest}, marker
 
 
 def quarantine(work, marker, digest):
