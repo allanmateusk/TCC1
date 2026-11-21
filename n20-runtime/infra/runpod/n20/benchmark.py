@@ -179,6 +179,9 @@ def verify_cuda_hardware(profile, snapshot, *, resident_pool=None, measured_peak
     # On subsequent reserved cases the verified residents already own weights.
     # Subtract only pinned tensor bytes, never a measured peak or safety margin.
     free_floor=required_gib if not already_loaded else required_gib - weights_gib*profile["models_per_gpu"]
+    from .cuda_bf16_probe import verify as verify_bf16_kernel
+    print(json.dumps({"cuda_bf16_preflight":verify_bf16_kernel(torch,n)},sort_keys=True),flush=True)
+    free_vram_gib = [torch.cuda.mem_get_info(i)[0] / 1024 ** 3 for i in range(n)]
     for i, free_gib in enumerate(free_vram_gib):
         with torch.cuda.device(i):
             if not torch.cuda.is_bf16_supported(including_emulation=False):
