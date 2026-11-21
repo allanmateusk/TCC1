@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from .watchdog import Binding, Resource, State, arm, tick
+from .watchdog import Binding, Resource, State, arm, require_armed, tick
 
 
 class Fake:
@@ -35,9 +35,9 @@ class WatchdogTest(unittest.TestCase):
         self.b = Binding("a" * 32, "pod-test-1", "private-output", 1100, 1000, 40, max_attempts=2)
         arm(self.path, self.b)
         self.fake = Fake(self.b)
-        self.local = {"run_id": self.b.run_id, "completed": True}
+        self.local = {"run_id": self.b.run_id, "run_kind": "pilot", "scenario_id": "pilot", "completed": True}
         self.receipt = {"schema": "tcc-n20-r2-receipt/v1", "status": "verified",
-                        "run_id": self.b.run_id, "bucket": self.b.bucket, "key": self.b.key,
+                        "run_id": self.b.run_id, "run_kind": "pilot", "scenario_id": "pilot", "bucket": self.b.bucket, "key": self.b.key,
                         "nodes": 20, "rounds": 5, "verified_own_generations": 100, "sha256": "f"*64}
 
     def active(self, now, **kwargs):
@@ -63,7 +63,7 @@ class WatchdogTest(unittest.TestCase):
             ("stop", self.b.resource_id, self.b.run_id), ("inspect", self.b.resource_id)])
 
     def test_failed(self):
-        result = self.active(1002, local={"run_id": self.b.run_id, "status": "failed"})
+        result = self.active(1002, local={**self.local, "completed": False, "status": "failed"})
         self.assertEqual(result, {"status": "stopped", "reason": "failed"})
 
     def test_cancelled(self):
@@ -93,3 +93,39 @@ class WatchdogTest(unittest.TestCase):
     def test_local_completion_windows_upload_until_deadline(self):
         self.assertEqual(self.active(1045, local=self.local)["status"], "watching")
         self.assertEqual(self.active(1100, local=self.local)["reason"], "deadline")
+
+    def test_official_matches_kind_scenario_and_key(self):
+        path = self.path.with_name("official.json")
+        b = replace(self.b, run_kind="official", scenario_id="C13")
+        arm(path, b)
+        fake = Fake(b)
+        local = {**self.local, "run_kind": "official", "scenario_id": "C13"}
+        receipt = {**self.receipt, "run_kind": "official", "scenario_id": "C13",
+                   "key": b.key, "rounds": 50, "verified_own_generations": 1000}
+        self.assertEqual(b.key, f"tcc/prod/n20-{b.run_id}.zip")
+        for bad in ({"key": self.b.key}, {"run_kind": "pilot"}, {"scenario_id": "C12"},
+                    {"rounds": 5}, {"verified_own_generations": 100}):
+            self.assertEqual(tick(path, 1001, local=local, receipt={**receipt, **bad},
+                                  backend=fake, apply=True)["status"], "watching")
+        self.assertEqual(tick(path, 1001, local={**local, "scenario_id": "C12"}, receipt=receipt,
+                              backend=fake, apply=True)["status"], "watching")
+        self.assertEqual(tick(path, 1001, local=local, receipt=receipt,
+                              backend=fake, apply=True)["reason"], "success_verified")
+        with self.assertRaises(ValueError):
+            replace(b, scenario_id="C99")
+
+    def test_launcher_requires_current_armed_scope(self):
+        expected = {"run_id": self.b.run_id, "run_kind": "pilot", "scenario_id": "pilot"}
+        self.assertEqual(require_armed(self.path, 1000, **expected), self.b)
+        for p, now, criteria in (
+            (self.path, 1000, {**expected, "scenario_id": "C12"}),
+            (self.path, 1000, {**expected, "run_id": "b" * 32}),
+            (self.path, 1045, expected),
+            (self.path, 1100, expected),
+            (self.path.with_name("missing.json"), 1001, expected),
+        ):
+            with self.assertRaises(ValueError):
+                require_armed(p, now, **criteria)
+        self.active(1001, cancel=True)
+        with self.assertRaises(ValueError):
+            require_armed(self.path, 1001, **expected)

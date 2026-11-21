@@ -124,8 +124,11 @@ aplica limite do job de 120 minutos. Não usa segredos de alocação nem comando
 GitHub só oferece `workflow_dispatch` se o arquivo do workflow existir também
 na branch padrao. Ate isso ser aprovado e publicado la, o GitHub executa o
 preflight no push; a CLI do proprio runner e a alternativa para o piloto.
-Os 17 cenarios oficiais continuam planificáveis mas bloqueados para execucao
-até qualificar o exportador de 50 rodadas e o ciclo de vida externo.
+Os 17 cenarios oficiais ja podem produzir o pacote validado de 50 rodadas,
+mas permanecem bloqueados por padrao. So qualifique
+TCC_N20_OFFICIAL_QUALIFIED=true apos provar o ciclo de vida externo, volume
+e R2 reais. A trava complementa a autorizacao manual e a armacao externa
+valida para o UUID, a fase, o cenario e o recurso.
 
 O workflow antigo do projeto de origem não foi copiado. Para
 provisionar N20 mais tarde, é necessário validar uma imagem compatível com
@@ -181,9 +184,13 @@ sem dar ao runner acesso aos segredos ou ao estado do watchdog.
 O runner cria o diretorio UUID uma vez, registra a SHA do checkout limpo,
 escreve live-run.json de forma atomica e emite heartbeat.json durante a
 execucao. Em falha marca failed/cancelled quando possivel e guarda os
-parciais; eles nao servem para o upload do piloto. No sucesso do piloto,
-ele confere 5 rodadas/100 geracoes, quorum registrado, 20 ledgers,
-auditoria da rodada 3 e runtime BF16 de cada no. A geracao e o upload sao
+parciais; eles nao servem para o upload do piloto. No sucesso, verifica 5 rodadas/100 geracoes no piloto ou
+50 rodadas/1.000 geracoes no oficial. Confere agenda, auditorias, genese
+(quando houver), quorum nas rodadas normais, 20 cadeias, reputacoes, respostas
+e runtime BF16. A prova de uma geracao por no/rodada vem da leitura da base
+local com os filhos encerrados: o CSV exporta somente fatos saneados,
+incluindo submitted (resposta numerica enviada) e intentional_absence
+(omissao programada, que nao elimina a geracao). A geracao e o upload sao
 processos separados; nenhuma chave de bucket ou de provedor entra nos
 processos de inferencia. O runner nao envia arquivos, nao encerra a
 alocacao do host e nao executa Terraform apply.
@@ -193,12 +200,15 @@ isolado do uploader:
 
     python -m infra.runpod.n20.r2_verified_pilot prepare --durable-root "$TCC_N20_DURABLE_ROOT" --run-id "$N20_RUN_ID"
 
-A preparacao sem rede cria e valida r2-pilot.zip. O unico objeto permitido
-e tcc/piloto/n20-<run-id>.zip no bucket privado tcc. A lista fechada contem
-manifesto final, CSVs, eventos, ledgers e metadados BF16. Nao inclui banco
+A preparacao sem rede grava e valida r2-pilot.zip no piloto ou
+r2-official.zip no oficial. O unico objeto permitido no bucket privado tcc
+e tcc/piloto/n20-<run-id>.zip no piloto ou tcc/prod/n20-<run-id>.zip no oficial.
+O destino e calculado pelo manifesto, nao escolhido pelo operador. A lista
+fechada contem manifesto, CSVs, prova de geracoes, eventos, cadeias e runtime BF16. Nao inclui banco
 SQLite/WAL, config do host, logs, texto do modelo ou chaves. O arquivo
-r2-pilot.local.json (ignorado pelo Git) pode guardar somente endpoint,
-bucket=tcc, region=auto, prefix=tcc/piloto; nenhuma chave. O assinador
+r2-pilot.local.json (piloto) ou r2-official.local.json (oficial), ambos
+ignorados pelo Git, pode guardar somente endpoint, bucket=tcc, region=auto,
+prefix=tcc/piloto ou prefix=tcc/prod, respectivamente; nenhuma chave. O assinador
 externo cria duas concessoes privadas SigV4 de curta duracao para exatamente
 esse objeto. O PUT deve assinar If-None-Match:* (e, se assinar Content-Type,
 application/zip). Injete apenas no uploader, de forma nao interativa e
@@ -211,18 +221,21 @@ publico. Execute:
 O uploader faz um PUT condicional (nunca sobrescreve), um GET independente
 com ate tres tentativas limitadas e confere tamanho, SHA-256, membros do ZIP
 e todas as evidencias reabertas. Em PUT incerto, tenta so GET, nunca redespacha
-um PUT nesse processo. Depois escreve r2-downloaded.zip separado e o recibo
-atomico e saneado r2-verified.json. A mesma copia e mesmo recibo sao aceitos
-localmente sem repetir envio. Falha preserva evidencia e nao publica recibo.
+um PUT nesse processo. Em nova execucao, reutiliza os bytes exatos do ZIP
+duravel, sem nova inferencia ou empacotamento. HTTP 409/412 passa para GET:
+somente objeto byte a byte igual e aceito; objeto diferente nao e sobrescrito
+nem excluido. Depois escreve r2-downloaded.zip separado e o recibo atomico
+r2-verified.json (UUID, fase, cenario, SHA e contagens). Falha preserva o ZIP
+e nao publica recibo.
 Use um limite externo tambem para o uploader; o watchdog nao prolonga o
 prazo da GPU por causa de demora de rede ou armazenamento.
 
 O teste offline usa dados artificiais e adapter de desligamento falso. Para
 habilitar servidor real faltam: volume/ACLs medidos, assinador para esse escopo,
 adapter autenticado do provedor preso ao ID exato, agendamento independente,
-prazo nativo do provedor quando disponivel, circuito de alerta se a parada
-nao for confirmada, smoke no provedor e autorizacao do Allan. Nao assumir
+um segundo cutoff independente verificado, alerta se a parada nao for
+confirmada, smoke no provedor e autorizacao. As antigas flags RunPod
+--stop-after/--terminate-after foram removidas e nao eram aplicadas. Nao assumir
 que a GPU foi desligada apenas porque o cliente pediu a parada. Somente
 resultados reais, aprovados e recuperados com hash verificado contam como
-producao. O uploader ainda aceita apenas o piloto 20x5, nao os 17 cenarios
-da campanha.
+producao. O CI valida o roteiro HTTP de 50 rodadas no C13 com substituto, sem inferencia BF16 nem chamada real ao R2.

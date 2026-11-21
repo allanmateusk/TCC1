@@ -119,19 +119,16 @@ def preflight(profile, scenarios):
     print("Offline: 17 official scenarios and one separate baseline pilot; 20 BF16 processes, 10 per GPU.")
 
 
-def verify_controller_arm(path, run_dir, resource_id, run_id, *, now=None):
+def verify_controller_arm(path, run_dir, resource_id, run_id, *, run_kind="pilot", scenario_id="pilot", now=None):
     """Require separately owned controller state; deployment must also prove scheduler/TTL."""
     if path is None or not Path(path).is_absolute() or Path(path).is_symlink():
         raise ValueError("An independent controller arm record is required")
     path = Path(path).resolve(strict=True)
     if path.is_relative_to(run_dir.parent) or path.is_relative_to(ROOT.parent):
         raise ValueError("Controller state cannot reside in the runner project or output volume")
-    state = watchdog.State.load(path)
-    binding = state.binding
     tick = time.time() if now is None else now
-    if (binding.run_id != run_id or binding.resource_id != resource_id or binding.bucket != "tcc"
-        or not binding.armed_at <= tick < binding.deadline
-        or not 0 <= tick-state.last_seen < binding.stale_after or state.reason or state.verified_phase):
+    binding = watchdog.require_armed(path,tick,run_id=run_id,run_kind=run_kind,scenario_id=scenario_id)
+    if binding.resource_id != resource_id or binding.bucket != "tcc":
         raise ValueError("Controller state is stale, closed or bound to another resource")
     return binding.deadline
 
@@ -143,10 +140,11 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
     if sys.platform != "linux":
         raise RuntimeError("Live launch requires a dedicated Linux CUDA runner.")
     config, entry = scenario_args(profile, scenario, seed, rounds)
-    if entry["run_kind"] != "pilot":
-        raise ValueError("Official campaign is disabled until its verified export and external lifecycle are qualified")
+    if entry["run_kind"] == "official" and os.getenv("TCC_N20_OFFICIAL_QUALIFIED") != "true":
+        raise ValueError("Official case disabled until the independent provider lifecycle is qualified")
     run_dir = artifact_store.durable_run(durable_root, run_id, repo=ROOT.parent)
-    provider_deadline = verify_controller_arm(controller_state, run_dir, resource_id, run_id)
+    provider_deadline = verify_controller_arm(controller_state, run_dir, resource_id, run_id,
+                                              run_kind=entry["run_kind"], scenario_id=scenario["id"])
     if out is not None and out.resolve() != run_dir:
         raise ValueError("Output must match durable-root/run-id")
     git_sha = subprocess.check_output(["git", "-C", str(ROOT.parent), "rev-parse", "HEAD"], text=True).strip()
@@ -237,8 +235,7 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
         finalized = {**metadata, "status": "verified_local", "completed": True,
                      "verified_own_generations": entry["expected_own_generations"],
                      "finished": datetime.now(timezone.utc).isoformat()}
-        if entry["run_kind"] == "pilot":
-            finalized = artifact_store.finalize_pilot(out, finalized)
+        finalized = artifact_store.finalize_run(out, finalized)
         artifact_store.write_atomic(record, artifact_store.json_bytes(finalized), replace=True)
     except BaseException as exc:
         metadata.update(status="cancelled" if isinstance(exc, InterruptedError) else "failed",

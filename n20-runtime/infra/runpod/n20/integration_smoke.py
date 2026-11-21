@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import closing
 import json
 import os
@@ -15,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
 
-from . import benchmark
+from . import artifact_store, benchmark
 
 FAKE_ANSWER = 17
 
@@ -85,16 +86,29 @@ def capture_outcome(work, profile, scenario, entry):
            for r in events if r["planned"] or r["genesis"]):
         raise RuntimeError("Ground truth was not applied on every node")
     if genesis:
-        from csv import DictReader
         with (work / "leadership.csv").open("r", encoding="utf-8", newline="") as handle:
-            for row in DictReader(handle):
+            for row in csv.DictReader(handle):
                 if int(row["round_index"])+1 in genesis and (row["outcome"] != "calibration" or row["leader"] or row["auditor"]):
                     raise RuntimeError("Genesis has unexpected leadership/quorum")
         for ledger in (work / "ledgers").glob("*.json"):
             records = json.loads(ledger.read_text("utf8"))["records"]
             if [r["round_index"]+1 for r in records if r["kind"]=="calibration"] != genesis:
                 raise RuntimeError("Genesis not committed in every ledger")
+    # Exercise the real post-shutdown generation-evidence path using this
+    # stand-in database. It deliberately does not create a publishable manifest.
+    artifact_store._seal_generation_evidence(work, {
+        "scenario_id": scenario["id"], "run_kind": entry["run_kind"], "rounds": entry["rounds"],
+        "scenario": entry, "experiment_id": entry["id"],
+    })
+    with (work / artifact_store.GENERATIONS).open("r",encoding="utf-8",newline="") as handle:
+        evidence = list(csv.DictReader(handle))
+    if (len(evidence) != entry["expected_own_generations"]
+        or {int(row["seed"]) for row in evidence} != unique_seeds
+        or sum(int(row["intentional_absence"]) for row in evidence) != simulated_absent
+        or any(row["intentional_absence"]=="1" and row["submitted"]!="0" for row in evidence)):
+        raise RuntimeError("Finalized-generation evidence diverged from the stand-in protocol")
     return {"scenario": scenario["id"], "rounds": summary["summary"]["rounds"],
+            "generation_proof_rows": len(evidence),
             "nodes": profile["nodes"], "own_mock_generations": len(unique_seeds),
             "run_kind": entry["run_kind"], "expected_own_generations": entry["expected_own_generations"],
             "model_is_stand_in": True, "configured_dtype": profile["dtype"],

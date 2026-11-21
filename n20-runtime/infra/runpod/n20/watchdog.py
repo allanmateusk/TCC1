@@ -11,6 +11,8 @@ import os
 import re
 import tempfile
 
+from .campaign import IDS
+
 
 @dataclass(frozen=True)
 class Binding:
@@ -22,8 +24,13 @@ class Binding:
     stale_after: float
     retry_seconds: float = 15
     max_attempts: int = 5
+    run_kind: str = "pilot"
+    scenario_id: str = "pilot"
 
     def __post_init__(self):
+        if not ((self.run_kind == "pilot" and self.scenario_id == "pilot") or
+                (self.run_kind == "official" and self.scenario_id in IDS)):
+            raise ValueError("Unknown phase or mismatched scenario")
         if not re.fullmatch(r"[0-9a-f]{32}", self.run_id):
             raise ValueError("Invalid pilot run ID")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", self.resource_id):
@@ -39,7 +46,12 @@ class Binding:
 
     @property
     def key(self):
-        return f"tcc/piloto/n20-{self.run_id}.zip"
+        prefix = "piloto" if self.run_kind == "pilot" else "prod"
+        return f"tcc/{prefix}/n20-{self.run_id}.zip"
+
+    @property
+    def rounds(self):
+        return 5 if self.run_kind == "pilot" else 50
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,24 @@ def arm(path: Path, binding: Binding):
     return state
 
 
+def require_armed(path: Path, now: float, *, run_id: str, run_kind: str, scenario_id: str):
+    """Validate the exact run against independently protected, read-only state.
+
+    This attests a valid binding, not that a scheduler or provider is live.
+    Do not accept this file from a worker-writable output directory.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Missing independently armed state")
+    state = State.load(path)
+    b = state.binding
+    if (run_id, run_kind, scenario_id) != (b.run_id, b.run_kind, b.scenario_id):
+        raise ValueError("Armed binding does not match this run, phase and scenario")
+    if (not math.isfinite(now) or not b.armed_at <= now < min(b.deadline, state.last_seen + b.stale_after)
+            or state.reason or state.attempts or state.verified_phase):
+        raise ValueError("The bound resource is expired, stale or marked for stop")
+    return b
+
+
 def matches_receipt(binding: Binding, receipt: dict | None) -> bool:
     if not isinstance(receipt, dict):
         return False
@@ -103,10 +133,12 @@ def matches_receipt(binding: Binding, receipt: dict | None) -> bool:
         receipt.get("schema") == "tcc-n20-r2-receipt/v1"
         and receipt.get("status") == "verified"
         and receipt.get("run_id") == binding.run_id
+        and receipt.get("run_kind") == binding.run_kind
+        and receipt.get("scenario_id") == binding.scenario_id
         and receipt.get("bucket") == binding.bucket
         and receipt.get("key") == binding.key
         and all(type(receipt.get(k)) is int and receipt[k] == v
-                for k, v in {"nodes": 20, "rounds": 5, "verified_own_generations": 100}.items())
+                for k, v in {"nodes": 20, "rounds": binding.rounds, "verified_own_generations": 20 * binding.rounds}.items())
         and isinstance(receipt.get("sha256"), str)
         and re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"]) is not None
     )
@@ -116,7 +148,9 @@ def evaluate(binding: Binding, state: State, now: float, *,
              local: dict | None, receipt: dict | None, heartbeat: dict | None, cancel: bool):
     if not math.isfinite(now) or now < binding.armed_at:
         raise ValueError("Invalid controller clock")
-    local = local if isinstance(local, dict) and local.get("run_id") == binding.run_id else {}
+    local = local if isinstance(local, dict) and (
+        local.get("run_id"), local.get("run_kind"), local.get("scenario_id")
+    ) == (binding.run_id, binding.run_kind, binding.scenario_id) else {}
     heartbeat = heartbeat.get("heartbeat_at_epoch") if isinstance(heartbeat, dict) and heartbeat.get("run_id") == binding.run_id else None
     if type(heartbeat) in (int, float) and binding.armed_at <= heartbeat <= now:
         state.last_seen = max(state.last_seen, heartbeat)

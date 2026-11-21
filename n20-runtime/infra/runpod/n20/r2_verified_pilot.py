@@ -1,9 +1,10 @@
-"""Publish only a finalized N20 pilot using short-lived single-object R2 grants."""
+"""Publish a finalized N20 pilot or official run using single-object R2 grants."""
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 import hmac
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ from zipfile import BadZipFile
 from . import artifact_store as store
 from . import r2_grants as transport
 
-KEYS = re.compile(r"tcc/piloto/n20-[0-9a-f]{32}\.zip\Z")
+KEYS = re.compile(r"tcc/(?:piloto|prod)/n20-[0-9a-f]{32}\.zip\Z")
 SCHEMA = "tcc-n20-r2-receipt/v1"
 PUT_ENV = "TCC_N20_R2_PUT_URL"
 GET_ENV = "TCC_N20_R2_GET_URL"
@@ -32,17 +33,32 @@ class Transient(TransferError):
     pass
 
 
-def object_key(run_id):
-    if not store.RUN_ID.fullmatch(run_id or ""):
-        raise ValueError("Malformed run ID")
-    return f"tcc/piloto/n20-{run_id}.zip"
+class ExistingObject(TransferError):
+    pass
+
+
+def object_key(run_id, kind="pilot"):
+    if not store.RUN_ID.fullmatch(run_id or "") or kind not in transport.PREFIXES:
+        raise ValueError("Malformed run ID or phase")
+    return f"{transport.PREFIXES[kind]}/n20-{run_id}.zip"
 
 
 def prepare(root, run_id):
-    key = object_key(run_id)
-    data = store.build_archive(root, run_id)
-    store.verify_archive(data, run_id)
-    store.write_atomic(root / store.ARCHIVE, data)
+    manifest = store.read_file(root,store.MANIFEST)
+    phase = json.loads(manifest).get("run_kind")
+    key = object_key(run_id,phase)
+    path = root / (store.ARCHIVE if phase=="pilot" else store.OFFICIAL_ARCHIVE)
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > store.MAX_ZIP:
+            raise ValueError("Unsafe staged ZIP")
+        with path.open("rb") as f:
+            data=f.read(store.MAX_ZIP+1)
+        # Keep original bytes across retries and across different ZIP writers.
+        store.verify_archive(data,run_id,expected_manifest=manifest)
+    else:
+        data=store.build_archive(root,run_id)
+        store.verify_archive(data,run_id,expected_manifest=manifest)
+        store.write_atomic(path,data)
     return data, key
 
 
@@ -59,7 +75,7 @@ def _request(open_url, request, deadline, clock, *, size):
         with open_url(request, timeout=_time_left(clock, deadline)) as response:
             status = response.status
             if status in (409,412) and method=="PUT":
-                raise TransferError("R2 object key already exists; no overwrite attempted")
+                raise ExistingObject("R2 object key already exists")
             if status in (408,429,500,502,503,504) or (method=="GET" and status==404):
                 raise Transient(f"R2 {method} not yet confirmed")
             if method=="PUT" and status in (200,201):
@@ -79,17 +95,19 @@ def _request(open_url, request, deadline, clock, *, size):
     except HTTPError as err:
         code = err.code
         if method=="PUT" and code in (409,412):
-            raise TransferError("R2 object key already exists; no overwrite attempted") from None
+            raise ExistingObject("R2 object key already exists") from None
         if code in (408,429,500,502,503,504) or (method=="GET" and code==404):
             raise Transient(f"R2 {method} not yet confirmed") from None
         raise TransferError(f"R2 {method} rejected with HTTP {code}") from None
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, HTTPException):
         raise Transient(f"R2 {method} interrupted") from None
 
 
 def upload(root, run_id, config, put_url, get_url, *, opener=None, now=None,
            clock=time.monotonic, sleep=time.sleep):
     data, key = prepare(root, run_id)
+    metrics = store.verify_archive(data, run_id)
+    transport.validate_config(config,metrics["run_kind"])
     local_digest = store.sha(data)
     receipt_path = root / store.RECEIPT
     if receipt_path.exists():
@@ -114,11 +132,14 @@ def upload(root, run_id, config, put_url, get_url, *, opener=None, now=None,
     put = Request(put_url, data=data, method="PUT",
                   headers={"Content-Type":"application/zip","If-None-Match":"*"})
     downloaded = None
+    existing_object = False
     try:
         _request(runner,put,deadline,clock,size=len(data))
+    except ExistingObject:
+        # Already uploaded or a collision: certify only by reading matching bytes.
+        existing_object = True
     except Transient:
-        # A timed-out write may have landed; do not issue a second PUT.
-        # Recovery is read-only; exact bytes are required to certify.
+        # A timed-out write may have landed; never issue a second PUT here.
         pass
     for delay in (0,.25,.75):
         if delay:
@@ -132,6 +153,8 @@ def upload(root, run_id, config, put_url, get_url, *, opener=None, now=None,
     if downloaded is None:
         raise TransferError("R2 GET did not verify within the bounded attempts")
     if len(downloaded)!=len(data) or not hmac.compare_digest(store.sha(downloaded),local_digest):
+        if existing_object:
+            raise TransferError("Existing R2 object differs from the durable ZIP; not overwritten")
         raise TransferError("R2 size or SHA-256 did not match")
     metrics = store.verify_archive(downloaded,run_id)
     store.write_atomic(root / store.DOWNLOADED, downloaded)
@@ -155,7 +178,8 @@ def main():
             result = {"status":"prepared_local","run_id":args.run_id,"bucket":transport.BUCKET,
                       "key":key,"bytes":len(data),"sha256":store.sha(data)}
         else:
-            cfg = transport.load_config()
+            phase = json.loads(store.read_file(root,store.MANIFEST)).get("run_kind")
+            cfg = transport.load_config(phase)
             result = upload(root,args.run_id,cfg,os.environ.pop(PUT_ENV,None),os.environ.pop(GET_ENV,None))
         print(json.dumps(result,sort_keys=True))
     except TransferError as exc:

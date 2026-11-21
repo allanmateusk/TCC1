@@ -8,18 +8,25 @@ import re
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPRedirectHandler
 
-LOCAL_CONFIG = Path(__file__).with_name("r2-pilot.local.json")
+LOCAL_CONFIG = {
+    "pilot": Path(__file__).with_name("r2-pilot.local.json"),
+    "official": Path(__file__).with_name("r2-official.local.json"),
+}
+PREFIXES = {"pilot":"tcc/piloto", "official":"tcc/prod"}
 BUCKET = "tcc"
-PREFIX = "tcc/piloto"
 REGION = "auto"
 R2_HOST_PATTERN = re.compile(r"[0-9a-f]{32}\.r2\.cloudflarestorage\.com\Z")
 
 
-def load_config(path=LOCAL_CONFIG):
+def load_config(kind, path=None):
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
+        cfg = json.loads((path or LOCAL_CONFIG[kind]).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raise ValueError("Missing or invalid local R2 pilot configuration.") from None
+    return validate_config(cfg, kind)
+
+
+def validate_config(cfg, kind):
     if not isinstance(cfg, dict) or set(cfg) != {"endpoint", "bucket", "region", "prefix"}:
         raise ValueError("R2 pilot config may contain only non-secret endpoint and scope fields.")
     if not all(isinstance(v, str) for v in cfg.values()):
@@ -27,7 +34,7 @@ def load_config(path=LOCAL_CONFIG):
     ep = urlsplit(cfg["endpoint"])
     if (ep.scheme != "https" or not R2_HOST_PATTERN.fullmatch(ep.netloc)
             or ep.path not in ("", "/") or ep.query or ep.fragment
-            or (cfg["bucket"], cfg["region"], cfg["prefix"]) != (BUCKET, REGION, PREFIX)):
+            or (cfg["bucket"], cfg["region"], cfg["prefix"]) != (BUCKET, REGION, PREFIXES.get(kind))):
         raise ValueError("Invalid R2 endpoint or pilot scope.")
     return cfg
 

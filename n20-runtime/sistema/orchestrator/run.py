@@ -242,7 +242,7 @@ async def run_dynamic_experiment(config: dict) -> dict:
                     returned = await asyncio.gather(*(
                         _post(client, f"{urls[n]}/oracle", {"record": record.to_json()}, timeout) for n in node_ids))
                     event["oracle_by_node"] = {
-                        n: ("applied" if item and item.get("status") == "applied" and item.get("head")==record.hash
+                        n: ("head_mismatch" if item and item.get("status") == "applied" and item.get("head") != record.hash
                             else (item or {}).get("status", "unreachable"))
                         for n, item in zip(node_ids, returned, strict=True)}
                     if any(not item or item.get("status") != "applied" or item.get("head") != record.hash
