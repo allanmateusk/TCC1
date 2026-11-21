@@ -29,6 +29,7 @@ mantendo o servidor responsivo (coleta assíncrona pelo orquestrador).
 from __future__ import annotations
 
 import asyncio
+import hmac
 from dataclasses import replace
 from contextlib import asynccontextmanager
 import hashlib
@@ -40,7 +41,7 @@ import time
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from ..core import behavior
@@ -611,6 +612,23 @@ async def answer(round_index: int) -> dict:
 @app.get("/state")
 async def state() -> dict:
     return _require_replica().snapshot()
+
+
+@app.get("/checkpoint-state")
+async def checkpoint_state(request: Request, round_index: int) -> dict:
+    """Read one replica at the coordinator fence; never restore via this endpoint."""
+    token = os.getenv("N20_CHECKPOINT_TOKEN")
+    run_id = os.getenv("N20_CHECKPOINT_RUN_ID")
+    provided = request.headers.get("X-N20-Checkpoint-Token", "")
+    presented_run = request.headers.get("X-N20-Checkpoint-Run", "")
+    if (not token or not run_id or not request.client or request.client.host not in {"127.0.0.1","::1"}
+        or not provided.isascii() or not hmac.compare_digest(token,provided) or presented_run != run_id):
+        raise HTTPException(status_code=404)
+    replica = _require_replica()
+    if replica.state.trace_round != round_index:
+        raise HTTPException(status_code=409,detail="Replica not at requested completed boundary")
+    from infra.runpod.n20.checkpoint import export_replica
+    return export_replica(replica)
 
 
 @app.get("/ledger")

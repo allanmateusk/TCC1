@@ -93,6 +93,7 @@ class SimulatedNetwork:
         self.config = config
         self.attacks = attacks
         self.groups: list[Group] = [Group(0, list(self.node_ids), Ledger(), NetworkState(self.node_ids, config))]
+        self.groups[0].state.trace_reputation()
         self._next_gid = 1
 
     # ------------------------------------------------------------------
@@ -216,6 +217,7 @@ class SimulatedNetwork:
         fork: Optional[Group] = None
         if refusers:
             fork = Group(self._next_gid, refusers, group.ledger.copy(), state.clone())
+            fork.state.trace_reputation()
             self._next_gid += 1
             for rec in outcome_records(record, decision, refuse=True):
                 fork.ledger.append(rec)
@@ -413,6 +415,7 @@ def log_round(
     audited: bool = False,
     calibration: bool = False,
     consensus_center: str = "medoid",
+    reputation_events: dict[str,list] | None = None,
 ) -> None:
     """Grava ``per_node.csv``, ``rounds.csv`` e ``leadership.csv`` da rodada.
 
@@ -451,6 +454,9 @@ def log_round(
         before = reps_before.get(node, initial)
         after = reps_after.get(node, before)
         delta = after - before
+        node_events = (reputation_events or {}).get(node, ())
+        consensus_events = [e for e in node_events if e["track"]=="consensus" and e["operation"]!="skip"]
+        alpha = consensus_events[0]["alpha_used"] if len(consensus_events)==1 else None
         update = ReputationUpdate(
             node_id=node,
             score_before=round(before, 6),
@@ -458,8 +464,8 @@ def log_round(
             delta=round(delta, 6),
             reward=round(max(0.0, delta), 6),
             punishment=round(max(0.0, -delta), 6),
-            alpha_used=0.0,
-            s=1.0 if delta > 0 else 0.0,
+            alpha_used=alpha,
+            s=None,
             mechanism=mechanism,
         )
         correct = response.answer is not None and response.answer == expected
@@ -493,6 +499,9 @@ def log_round(
             is_tie_majority=cons_m.is_tie,
             is_test=is_test,
         )
+
+    if reputation_events is not None:
+        logger.record_reputation_events(round_index,reputation_events)
 
     for outcome in outcomes:
         length, head = chains.get(outcome.gid, (0, ""))

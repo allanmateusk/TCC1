@@ -506,6 +506,8 @@ def _dynamic_round(
         is_test=is_test,
         consensus_mode=network.config.consensus_mode,
         consensus_center=network.config.consensus_center,
+        reputation_events={n:[e for e in (network.group_of(n).state.reputation_events or ())
+                              if e["node_id"]==n] for n in answers},
         audited=oracle_round(round_index, network.config),
         calibration=(
             network.config.signal != "consensus"

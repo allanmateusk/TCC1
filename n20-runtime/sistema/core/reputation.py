@@ -41,8 +41,8 @@ class ReputationUpdate:
     delta: float         # score_after - score_before
     reward: float        # max(0, delta)  — ganho de reputação
     punishment: float    # max(0, -delta) — perda de reputação
-    alpha_used: float    # taxa efetivamente aplicada nesta rodada
-    s: float             # sinal: 1.0 (acerto) ou 0.0 (erro/ausente)
+    alpha_used: float | None    # taxa efetivamente aplicada nesta rodada
+    s: float | None      # sinal: 1.0 (acerto) ou 0.0 (erro/ausente)
     mechanism: str       # "ema" | "ema_asymmetric" | "beta"
 
 
@@ -172,9 +172,9 @@ class ReputationTracker:
         """Não altera a reputação nesta rodada (resposta ausente no modo distância)."""
         before = self.reputation.get(node_id, self.initial)
         self.history.setdefault(node_id, [self.initial]).append(before)
-        return self._record(node_id, before, before, 0.0, 0.0, before)
+        return self._record(node_id, before, before, 0.0, None, None)
 
-    def _record(self, node_id: str, before: float, after: float, delta: float, alpha_used: float, s: float) -> ReputationUpdate:
+    def _record(self, node_id: str, before: float, after: float, delta: float, alpha_used: float | None, s: float | None) -> ReputationUpdate:
         return ReputationUpdate(
             node_id=node_id,
             score_before=round(before, 6),
@@ -182,7 +182,7 @@ class ReputationTracker:
             delta=round(delta, 6),
             reward=round(max(0.0, delta), 6),
             punishment=round(max(0.0, -delta), 6),
-            alpha_used=round(alpha_used, 6),
+            alpha_used=round(alpha_used, 6) if alpha_used is not None else None,
             s=s,
             mechanism=self.mechanism,
         )

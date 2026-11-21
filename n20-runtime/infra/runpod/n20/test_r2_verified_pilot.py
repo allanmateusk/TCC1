@@ -62,11 +62,23 @@ def fixture(root, *, missing_quorum=False, scenario="pilot"):
             l.append(RoundRecord("oracle",r-1,prev_hash=l.head,task_id=tasks[r-1]).sealed())
     def omitted(r,n):
         return n in plan["simulated_absences"].get(r,())
+    def trace_events(r,n):
+        cand = [rec for rec in l.records if rec.round_index==r-1]
+        return [dict(node_id=n,kind=rec.kind,record_hash=rec.hash,track="consensus",source="applied_record",
+            operation="skip" if omitted(r,n) else "update",
+            alpha_used=None if omitted(r,n) else .05 if rec.kind=="round" else .8,
+            signal=None if omitted(r,n) else .5,mechanism=method,before=.5,after=.5) for rec in cand]
+    def scalar(r,n):
+        seq=[e["alpha_used"] for e in trace_events(r,n) if e["operation"]=="update"]
+        return seq[0] if len(seq)==1 else ""
     files = {
+        store.REPUTATION_TRACE:"".join(json.dumps(dict(round_index=r-1,nodes={
+            n:trace_events(r,n) for n in store.NODES}))+"\n" for r in range(1,n_rounds+1)).encode(),
         "rounds.csv":csv_bytes([dict(round_index=r-1,num_nodes=20,calibration=int(r in genesis),is_test=int(r in fixed),
             audited=int(r in audits),task_id=tasks[r-1]) for r in range(1,n_rounds+1)]),
         "per_node.csv":csv_bytes([dict(round_index=r-1,node_id=n,profile="malicious" if n in malicious else "honest",
-            mechanism=method,answered=int(not omitted(r,n)),answer="" if omitted(r,n) else "42",task_id=tasks[r-1])
+            mechanism=method,answered=int(not omitted(r,n)),answer="" if omitted(r,n) else "42",task_id=tasks[r-1],
+            alpha_used=scalar(r,n),reputation_before=.5,reputation_after=.5)
             for r in range(1,n_rounds+1) for n in store.NODES]),
         "leadership.csv":csv_bytes([dict(round_index=r-1,is_reference=1,leader="" if r in genesis else "node-1",
             auditor="" if r in genesis else "node-2",outcome="calibration" if r in genesis else "accepted",

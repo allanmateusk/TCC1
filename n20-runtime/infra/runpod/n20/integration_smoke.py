@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 from contextlib import closing
 import json
 import os
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -22,9 +24,25 @@ FAKE_ANSWER = 17
 
 
 class StandInModel:
+    def __init__(self, *, phase="initial"):
+        self.phase=phase
+
     def sample(self, question, *, temperature, top_p, seed):
         if not question or seed is None:
             raise ValueError("Expected an actual question and per-node seed")
+        run_id=os.getenv("N20_CHECKPOINT_RUN_ID")
+        if run_id:
+            node=os.environ["NODE_ID"]
+            candidates=[r for r in range(5) if seed==int.from_bytes(
+                hashlib.sha256(f"0:{r}:{node}".encode()).digest()[:8],"big")&((1<<63)-1)]
+            if len(candidates)!=1:
+                raise ValueError("Unexpected stand-in round seed")
+            path=Path(os.environ["MODEL_CACHE_DIR"])/"stand-in-calls.jsonl"
+            with path.open("a",encoding="utf-8") as stream:
+                stream.write(json.dumps({"run_id":run_id,"phase":self.phase,"node":node,
+                                         "round":candidates[0]+1,"seed":seed,"pid":os.getpid()})+"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
         return FAKE_ANSWER, f"#### {FAKE_ANSWER}"
 
 
@@ -35,7 +53,14 @@ def start_test_node(args):
 
     class DedicatedTestModel(DedicatedModel):
         def __init__(self, **kwargs):
-            super().__init__(factory=StandInModel, **kwargs)
+            super().__init__(factory=lambda:StandInModel(phase="resume" if getattr(args,"restore",False) else "initial"),
+                             **kwargs)
+    if getattr(args,"restore",False):
+        from .resume_smoke import bound_frontier
+        from .checkpoint import replay_replica
+        work=Path(os.environ["MODEL_CACHE_DIR"]).resolve().parents[1]
+        _, marker = bound_frontier(work,os.environ["N20_CHECKPOINT_RUN_ID"])
+        app._replica=replay_replica(marker["replicas"][app.NODE_ID],marker["round_index"],app._protocol,app._graph)
 
     app.DedicatedModel = DedicatedTestModel
     uvicorn.run(app.app, host=args.host, port=args.port, workers=1, access_log=False)
@@ -94,6 +119,16 @@ def capture_outcome(work, profile, scenario, entry):
             records = json.loads(ledger.read_text("utf8"))["records"]
             if [r["round_index"]+1 for r in records if r["kind"]=="calibration"] != genesis:
                 raise RuntimeError("Genesis not committed in every ledger")
+    trace = [json.loads(line) for line in (work / artifact_store.REPUTATION_TRACE).read_text("utf8").splitlines()]
+    if len(trace)!=entry["rounds"] or [r["round_index"] for r in trace]!=list(range(entry["rounds"])):
+        raise RuntimeError("Reputation trace did not cover every round")
+    if not any(e["alpha_used"] == .05 for r in trace for updates in r["nodes"].values() for e in updates):
+        raise RuntimeError("No authoritative ordinary EMA updates in the HTTP smoke")
+    for index,round_trace in enumerate(trace):
+        for node,updates in round_trace["nodes"].items():
+            if node in plan["simulated_absences"].get(index+1,()) and any(
+                e["kind"] in {"round","calibration","oracle"} and e["operation"]=="update" for e in updates):
+                raise RuntimeError("Intentional omission was treated as a distance-scoring update")
     # Exercise the real post-shutdown generation-evidence path using this
     # stand-in database. It deliberately does not create a publishable manifest.
     artifact_store._seal_generation_evidence(work, {
@@ -116,8 +151,15 @@ def capture_outcome(work, profile, scenario, entry):
             "genesis": genesis, "planned_audits": plan["planned_rounds"], "ledgers_valid": summary["config"]["ledgers_valid"]}
 
 
-def test_end_to_end(output, pilot_rounds=None, scenario_filter=None):
+def test_end_to_end(output, pilot_rounds=None, scenario_filter=None, capture_checkpoints=False, fail_before=None):
+    from . import checkpoint
     worker = benchmark.worker
+    if capture_checkpoints:
+        if scenario_filter not in (None,"pilot") or pilot_rounds not in (None,5):
+            raise ValueError("Checkpoint HTTP smoke is restricted to the stand-in pilot")
+        scenario_filter = "pilot"
+    elif fail_before is not None:
+        raise ValueError("Simulated interruption requires checkpoint capture")
     spawned = []
     profile, scenarios = benchmark.load_profile()
     output = output.resolve()
@@ -129,6 +171,10 @@ def test_end_to_end(output, pilot_rounds=None, scenario_filter=None):
         scenario = scenarios[scenario_id]
         config, item = benchmark.scenario_args(profile, scenario, 0, pilot_rounds)
         work = output / scenario_id
+        if capture_checkpoints:
+            rid=uuid.uuid4().hex
+            work=output/rid
+            item["checkpoint_capture"]={"run_id":rid,"git_sha":"8"*40,"tasks_sha256":profile["task_sha256"]}
         work.mkdir()
         deadline = time.monotonic() + 300
 
@@ -140,6 +186,9 @@ def test_end_to_end(output, pilot_rounds=None, scenario_filter=None):
             if command[1:3] == ["-m", "uvicorn"]:
                 port = command[command.index("--port") + 1]
                 command = [command[0], "-B", "-m", __spec__.name, "test-node", "--port", port]
+            elif command[1:3] == ["-m", "sistema.orchestrator.run"] and fail_before is not None:
+                command = [command[0], "-B", "-m", __spec__.name, "interrupt-coordinator",
+                           "--before", str(fail_before), "--config", command[-1]]
             proc = subprocess.Popen(command, *args, **kwargs)
             spawned.append(proc)
             return proc
@@ -148,9 +197,43 @@ def test_end_to_end(output, pilot_rounds=None, scenario_filter=None):
         with patch.object(worker, "subprocess", SimpleNamespace(
             Popen=replace_model_only, TimeoutExpired=subprocess.TimeoutExpired, STDOUT=subprocess.STDOUT
         )):
-            worker.execute_scenario(work, item, config, snapshot_placeholder, ["mock0", "mock1"],
-                                    check, lambda _state, **_tags: None)
-        reports.append(capture_outcome(work, profile, scenario, item))
+            try:
+                worker.execute_scenario(work, item, config, snapshot_placeholder, ["mock0", "mock1"],
+                                        check, lambda _state, **_tags: None)
+                if fail_before is not None:
+                    raise AssertionError("Expected the injected coordinator interruption")
+            except RuntimeError:
+                if fail_before is None or b"TEST_CONTROLLED_CHECKPOINT_INTERRUPTION" not in (
+                    work/"orchestrator.log").read_bytes():
+                    raise
+        report = capture_outcome(work, profile, scenario, item) if fail_before is None else {
+            "scenario":scenario_id,"model_is_stand_in":True,"interrupted_before_checkpoint":fail_before+1}
+        if capture_checkpoints:
+            from sistema.orchestrator.run import _protocol_config, load_config
+            from sistema.core.topology import build_graph
+            raw=load_config(str(work/"config.yaml"))
+            identity=checkpoint.Identity(**raw["checkpoint_identity"])
+            last,_=checkpoint.CheckpointStore(work,identity).recover()
+            expected = item["rounds"]-1 if fail_before is None else fail_before-1
+            if last["round_index"]!=expected:
+                raise RuntimeError("Checkpoint marker did not match the durable boundary")
+            checkpoint.verify_log_prefixes(work,last)
+            protocol=_protocol_config(raw)
+            graph=build_graph(checkpoint.NODES,raw["topology"],degree=raw["degree"],seed=raw["seed"])
+            for row in last["replicas"].values():
+                checkpoint.replay_replica(row,expected,protocol,graph)
+            report.update(checkpoint_run_id=identity.run_id,checkpoint_completed_rounds=expected+1,
+                          verified_replica_replays=len(last["replicas"]))
+            if fail_before is not None:
+                with (work/"rounds.csv").open(encoding="utf-8",newline="") as h:
+                    if len(list(csv.DictReader(h))) != fail_before+1:
+                        raise RuntimeError("Controlled interruption did not leave the expected uncommitted suffix")
+                for node in checkpoint.NODES:
+                    with closing(sqlite3.connect((work/"node-models"/node/"inferencias.sqlite").resolve().as_uri()+"?mode=ro",uri=True)) as db:
+                        if db.execute("SELECT MAX(round_index) FROM generations").fetchone()[0] != fail_before:
+                            raise RuntimeError("Missing preserved next-round stand-in sample")
+                report["speculative_generations_preserved"]=20
+        reports.append(report)
         if any(proc.poll() is None for proc in spawned):
             raise RuntimeError("Supervisor left a subprocess running")
         for i in range(profile["nodes"]):
@@ -163,21 +246,42 @@ def test_end_to_end(output, pilot_rounds=None, scenario_filter=None):
     (output / "integration-report.json").write_text(json.dumps(reports, indent=2)+"\n", encoding="utf8")
 
 
+def interrupted_coordinator(args):
+    from .checkpoint import CheckpointStore
+    from sistema.orchestrator import run
+    saved=CheckpointStore.publish
+    def stop_between_logs_and_marker(store, round_index, **kwargs):
+        if round_index==args.before:
+            raise RuntimeError("TEST_CONTROLLED_CHECKPOINT_INTERRUPTION")
+        return saved(store,round_index,**kwargs)
+    with patch.object(CheckpointStore,"publish",stop_between_logs_and_marker):
+        sys.argv=["test-coordinator","--config",args.config]
+        run.main()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
     node = sub.add_parser("test-node")
     node.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1"])
     node.add_argument("--port", type=int, required=True)
+    node.add_argument("--restore", action="store_true", help=argparse.SUPPRESS)
     smoke = sub.add_parser("run")
     smoke.add_argument("--output", type=Path, required=True)
     smoke.add_argument("--rounds", type=int, choices=(5,), help="Run only the five-round baseline pilot.")
     smoke.add_argument("--scenario", choices=("pilot", "C11", "C13", "C05"), help="Test one configured path.")
+    smoke.add_argument("--checkpoint", action="store_true")
+    smoke.add_argument("--interrupt-before-checkpoint", type=int, choices=(1,2,3,4))
+    cut=sub.add_parser("interrupt-coordinator", help=argparse.SUPPRESS)
+    cut.add_argument("--config",required=True)
+    cut.add_argument("--before",type=int,required=True)
     args = parser.parse_args()
     if args.mode == "test-node":
         start_test_node(args)
+    elif args.mode=="interrupt-coordinator":
+        interrupted_coordinator(args)
     else:
-        test_end_to_end(args.output, args.rounds, args.scenario)
+        test_end_to_end(args.output,args.rounds,args.scenario,args.checkpoint,args.interrupt_before_checkpoint)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -136,7 +137,7 @@ def _groups_by_head(states: dict[str, dict]) -> dict[str, list[str]]:
     return groups
 
 
-async def run_dynamic_experiment(config: dict) -> dict:
+async def run_dynamic_experiment(config: dict, *, offline_test_resume=None) -> dict:
     """Rodadas conduzidas pelos próprios nós (líder eleito pela cadeia).
 
     O coordenador não decide nada do protocolo: pergunta a um nó de cada cópia
@@ -165,10 +166,31 @@ async def run_dynamic_experiment(config: dict) -> dict:
     output_dir = config.get("output_dir", os.path.join("sistema", "results", "experimento"))
     graph = build_graph(node_ids, config.get("topology", "kregular"), degree=int(config.get("degree", 4)), seed=int(config.get("seed", 0)))
 
-    logger = MetricsLogger(output_dir, experiment_id=config.get("experiment_id"), overwrite=True)
+    if offline_test_resume is not None and (not config.get("checkpoint_identity")
+        or config["checkpoint_identity"].get("scenario_id")!="pilot"):
+        raise ValueError("Offline restart proof supports only the checkpointed pilot")
+    cursor = 0 if offline_test_resume is None else offline_test_resume["round_index"]+1
+    logger = MetricsLogger(output_dir, experiment_id=config.get("experiment_id"), overwrite=True,
+                           resume_prefix_rounds=cursor or None)
     campaign = config.get("campaign_plan")
+    checkpoint_identity = config.get("checkpoint_identity")
+    if checkpoint_identity:
+        from infra.runpod.n20.artifact_store import json_bytes, sha
+        from infra.runpod.n20.checkpoint import CheckpointStore, Identity, capture_log_prefixes
+        store = CheckpointStore(Path(output_dir), Identity(**checkpoint_identity))
+        if sha(json_bytes({k:v for k,v in config.items() if k != 'checkpoint_identity'})) != store.identity.config_sha256:
+            raise ValueError('Checkpoint effective configuration differs from its identity')
+        checkpoint_token = os.getenv("N20_CHECKPOINT_TOKEN")
+        if not checkpoint_token or os.getenv("N20_CHECKPOINT_RUN_ID") != store.identity.run_id:
+            raise ValueError("Missing checkpoint authorization scoped to this pilot")
     gid_of: dict[str, int] = {n: 0 for n in node_ids}
     next_gid = 1
+    if offline_test_resume is not None:
+        prior,_ = store.recover()
+        if prior != offline_test_resume or not 0<cursor<rounds:
+            raise ValueError("Offline recovery cursor is not the latest committed marker")
+        gid_of=dict(prior["groups"])
+        next_gid=prior["next_gid"]
     states: dict[str, dict] = {}
 
     async def read_states(client: httpx.AsyncClient) -> dict[str, dict]:
@@ -182,7 +204,11 @@ async def run_dynamic_experiment(config: dict) -> dict:
         async with httpx.AsyncClient() as client:
             await wait_for_nodes(client, nodes)
             states = await read_states(client)
-            for round_index in range(rounds):
+            if offline_test_resume is not None and (set(states)!=set(node_ids) or any(
+                states[n]["head"]!=prior["replicas"][n]["head"] or states[n]["members"]!=prior["replicas"][n]["members"]
+                for n in node_ids)):
+                raise RuntimeError("Restored HTTP nodes do not match the checkpoint")
+            for round_index in range(cursor,rounds):
                 task = tasks[round_index % len(tasks)]
                 expected = normalize(task["answer"])
                 this_is_test = is_test_round(round_index, cfg.test_every)
@@ -269,6 +295,10 @@ async def run_dynamic_experiment(config: dict) -> dict:
 
                 states = await read_states(client)
                 after = {n: s["consensus"].get(n, cfg.initial) for n, s in states.items()}
+                if campaign and any(states[n].get("reputation_trace_round") != round_index for n in node_ids):
+                    raise RuntimeError("Missing committed reputation trace for a campaign node")
+                traces = {n: states.get(n,{}).get("reputation_events",[])
+                          if states.get(n,{}).get("reputation_trace_round")==round_index else [] for n in node_ids}
                 final_groups = _groups_by_head(states)
                 reference_members = max(final_groups.values(), key=lambda m: (honest_count(m), len(m)))
                 chains = {gid_of[m[0]]: (states[m[0]]["chain_length"], h) for h, m in final_groups.items()}
@@ -287,12 +317,28 @@ async def run_dynamic_experiment(config: dict) -> dict:
                     reference_members=reference_members, outcomes=outcomes, chains=chains,
                     mechanism=cfg.mechanism, initial=cfg.initial, is_test=this_is_test,
                     consensus_mode=cfg.consensus_mode, consensus_center=cfg.consensus_center,
+                    reputation_events=traces,
                     audited=oracle_round(round_index, cfg),
                     calibration=genesis if campaign else cfg.signal != "consensus" and round_index < cfg.defense.calibration_rounds,
                 )
                 if campaign:
                     event["complete"] = True
                     _audit_event(output_dir, event)
+                if checkpoint_identity:
+                    async def capture(node_id):
+                        response = await client.get(f"{urls[node_id]}/checkpoint-state", timeout=timeout,
+                            params={"round_index":round_index}, headers={
+                                "X-N20-Checkpoint-Token":checkpoint_token, "X-N20-Checkpoint-Run":store.identity.run_id})
+                        if response.status_code != 200:
+                            raise RuntimeError("A replica did not export the completed round boundary")
+                        return response.json()
+
+                    snapshots = dict(zip(node_ids, await asyncio.gather(*(capture(n) for n in node_ids)), strict=True))
+                    if any(snapshots[n]["head"]!=states[n]["head"] or snapshots[n]["members"]!=states[n]["members"]
+                           for n in node_ids):
+                        raise RuntimeError("Replica mutated past the completed checkpoint fence")
+                    store.publish(round_index,replicas=snapshots,groups=dict(gid_of),next_gid=next_gid,
+                                  log_prefixes=capture_log_prefixes(Path(output_dir)))
                 _print_dynamic_round(round_index, outcomes, this_is_test)
 
             ledgers = await asyncio.gather(*(_get(client, f"{urls[n]}/ledger", timeout) for n in node_ids))

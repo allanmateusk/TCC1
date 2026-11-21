@@ -182,6 +182,8 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
         if free_gib < required_gib:
             raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {required_gib:.2f} GiB required.")
     out = run_dir
+    if entry["run_kind"]=="pilot":
+        entry["checkpoint_capture"]={"run_id":run_id,"git_sha":git_sha,"tasks_sha256":profile["task_sha256"]}
     artifact_store.create_run_directory(out)
     check_mapping(profile, scenario, seed, out, snapshot, rounds)
     metadata = {"profile": profile, "scenario": entry, "started": datetime.now(timezone.utc).isoformat(),

@@ -5,6 +5,7 @@ import csv
 from contextlib import ExitStack
 import json
 import os
+import secrets
 from pathlib import Path
 import subprocess
 import sys
@@ -156,8 +157,23 @@ def child_environment(parent):
 def execute_scenario(work, entry, configuration, snapshot, devices, check, progress):
     specifications, config = scenario_configuration(configuration, entry, work, snapshot)
     config_path = work / "config.yaml"
-    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     env = child_environment(os.environ)
+    checkpoints = entry.get("checkpoint_capture")
+    if checkpoints:
+        from dataclasses import asdict
+        from infra.runpod.n20.artifact_store import json_bytes, sha
+        from infra.runpod.n20.checkpoint import Identity
+        if entry["run_kind"] != "pilot" or work.name != checkpoints["run_id"]:
+            raise ValueError("Checkpoint capture was qualified only for pilot")
+        identity = Identity(
+            run_id=checkpoints["run_id"], experiment_id=entry["id"], scenario_id="pilot",
+            seed=entry["semente"], rounds=entry["rounds"], git_sha=checkpoints["git_sha"],
+            model_revision=configuration["model_revision"], config_sha256=sha(json_bytes(config)),
+            tasks_sha256=checkpoints["tasks_sha256"], audit_sha256=sha(json_bytes(entry["audit_plan"])),
+        )
+        config["checkpoint_identity"]=asdict(identity)
+        env.update(N20_CHECKPOINT_TOKEN=secrets.token_hex(32),N20_CHECKPOINT_RUN_ID=identity.run_id)
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     children = []
     ready = {}
     with ExitStack() as stack:
@@ -208,7 +224,9 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                     raise RuntimeError("Um nó encerrou antes da conclusão do cenário.")
                 rounds = work / "rounds.csv"
                 count = 0
-                if "audit_plan" in entry:
+                if checkpoints:
+                    count = len(list(work.glob("checkpoint-[0-9][0-9].json")))
+                elif "audit_plan" in entry:
                     count = len(_completed_campaign_rounds(work))
                 elif rounds.exists():
                     with rounds.open(encoding="utf-8", newline="") as stream:
@@ -227,3 +245,9 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                      quantization=configuration["quantization"], dtype=configuration["dtype"])
     if "audit_plan" in entry:
         _verify_campaign(work, config, entry)
+    if checkpoints:
+        from infra.runpod.n20.checkpoint import CheckpointStore, verify_log_prefixes
+        frontier,_ = CheckpointStore(work,identity).recover()
+        if frontier is None or frontier["round_index"] != entry["rounds"]-1:
+            raise RuntimeError("Pilot completed without a verified final checkpoint")
+        verify_log_prefixes(work,frontier)

@@ -17,7 +17,8 @@ NODES = tuple(f"node-{n}" for n in range(20))
 RUNTIME = tuple(f"node-models/{n}/model-runtime.json" for n in NODES)
 LEDGERS = tuple(f"ledgers/{n}.json" for n in NODES)
 GENERATIONS = "verified-generations.csv"
-METRICS = (GENERATIONS, "rounds.csv", "per_node.csv", "leadership.csv", "reputation_history.csv", "audit-events.jsonl", *LEDGERS, *RUNTIME)
+REPUTATION_TRACE = "reputation-updates.jsonl"
+METRICS = (GENERATIONS, REPUTATION_TRACE, "rounds.csv", "per_node.csv", "leadership.csv", "reputation_history.csv", "audit-events.jsonl", *LEDGERS, *RUNTIME)
 MANIFEST = "live-run.json"
 ARCHIVE_FILES = (MANIFEST, *METRICS)
 MAX_FILE = 1024 * 1024
@@ -220,12 +221,45 @@ def validate_files(files, run_id):
         for r,row in enumerate(events,1)
     ):
         raise ValueError("Missing or invalid audit/genesis events")
+    traces = [json.loads(line) for line in files[REPUTATION_TRACE].splitlines()]
+    if [row["round_index"] for row in traces] != list(range(n_rounds)) or any(set(row["nodes"])!=set(NODES) for row in traces):
+        raise ValueError("Missing round or node in authoritative reputation trace")
     from sistema.core.ledger import Ledger
     for n in NODES:
         l = json.loads(files[f"ledgers/{n}.json"])
         runtime = json.loads(files[f"node-models/{n}/model-runtime.json"])
         if (l.get("node_id")!=n or l.get("valid") is not True or not Ledger.from_json(l["records"]).verify_chain()):
             raise ValueError("Node ledger failed hash verification")
+        by_hash = {r["hash"]:(i,r["kind"],r["round_index"]) for i,r in enumerate(l["records"])}
+        for index,trace in enumerate(traces):
+            rows = trace["nodes"][n]
+            last,order = {},-1
+            cell = by_cell[index,n]
+            for e in rows:
+                rec = by_hash.get(e["record_hash"])
+                track = e["track"]
+                op = e["operation"]
+                alpha = e["alpha_used"]
+                if (rec is None or rec[0]<order or rec[1:]!=(e["kind"],index) or e["node_id"]!=n
+                    or track not in {"consensus","power"} or e["mechanism"]!=cell["mechanism"]
+                    or op not in {"update","skip","snapshot_without_ema"}
+                    or not all(0 <= e[k] <= 1 for k in ("before","after"))
+                    or (track in last and abs(last[track]-e["before"])>2e-6)):
+                    raise ValueError("Invalid reputation event provenance, state or order")
+                if ((op=="update" and (alpha is None or not (0 <= alpha <= 1))) or
+                    (op!="update" and alpha is not None) or
+                    (op=="skip" and (e["before"]!=e["after"] or e["signal"] is not None))):
+                    raise ValueError("Invalid alpha or absence in reputation trace")
+                last[track],order=e["after"],rec[0]
+            scores=[e for e in rows if e["track"]=="consensus"]
+            scalar=[e["alpha_used"] for e in scores if e["operation"]!="skip"]
+            expected_scalar=scalar[0] if len(scalar)==1 else None
+            got_scalar=float(cell["alpha_used"]) if cell["alpha_used"]!="" else None
+            if got_scalar!=expected_scalar or (scores and (
+                abs(float(cell["reputation_before"])-scores[0]["before"])>2e-6 or
+                abs(float(cell["reputation_after"])-scores[-1]["after"])>2e-6
+            )) or (not scores and cell["reputation_before"]!=cell["reputation_after"]):
+                raise ValueError("CSV reputation/alpha disagrees with the applied trace")
         for kinds, expected in (({"round","void"},routine),({"calibration"},genesis),({"oracle"},audits)):
             observed = [r["round_index"]+1 for r in l["records"] if r["kind"] in kinds]
             if observed != sorted(expected):

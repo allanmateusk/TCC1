@@ -126,6 +126,12 @@ class NetworkState:
         self.presence: dict[str, list[bool]] = {nid: [] for nid in self.node_ids}
         self.last_leader: Optional[str] = None
         self.rotation = 0
+        self.reputation_events: list[dict] | None = None
+        self.trace_round: int | None = None
+
+    def trace_reputation(self):
+        self.reputation_events = []
+        self.trace_round = None
 
     def _tracker(self) -> ReputationTracker:
         c = self.config
@@ -151,6 +157,8 @@ class NetworkState:
         twin.presence = {nid: list(values) for nid, values in self.presence.items()}
         twin.last_leader = self.last_leader
         twin.rotation = self.rotation
+        twin.reputation_events = None
+        twin.trace_round = None
         return twin
 
     def snapshot(self) -> dict:
@@ -546,32 +554,65 @@ def calibration_record(
 # Aplicação de registros
 # ---------------------------------------------------------------------------
 
-def _punish(state: NetworkState, node_id: str) -> None:
+
+def _trace(state, record, track, update, *, source):
+    if state.reputation_events is None:
+        return
+    state.reputation_events.append({
+        "node_id":update.node_id, "kind":record.kind, "record_hash":record.hash,
+        "track":track, "source":source, "operation":"update" if update.alpha_used is not None else "skip",
+        "alpha_used":update.alpha_used, "signal":update.s, "mechanism":update.mechanism,
+        "before":update.score_before, "after":update.score_after,
+    })
+
+
+def _punish(state: NetworkState, record: RoundRecord, node_id: str) -> None:
     alpha = state.config.punish_alpha
-    state.power.update(node_id, False, alpha=alpha)
+    change = state.power.update(node_id, False, alpha=alpha)
+    _trace(state,record,"power" if state.split else "consensus",change,source="applied_record")
     if state.split:
-        state.consensus.update(node_id, False, alpha=alpha)
+        change=state.consensus.update(node_id, False, alpha=alpha)
+        _trace(state,record,"consensus",change,source="applied_record")
 
 
 def apply_record(state: NetworkState, record: RoundRecord) -> None:
-    """Atualiza o estado derivado com um registro já aceito pela réplica."""
+    """Apply a committed record and optionally trace the actual state transitions."""
+    if state.reputation_events is not None and state.trace_round != record.round_index:
+        state.trace_round = record.round_index
+        state.reputation_events.clear()
     if record.kind == "round":
-        state.restore(record.state_after)
         listed = record.responses_map()
+        if state.reputation_events is not None:
+            # The ledger stores a sealed snapshot, not alpha. Derive metadata with
+            # the authoritative consensus implementation and prove that its state
+            # is the one applied. Do not describe an accepted forgery as EMA.
+            _, _, recomputed, changes = compute_round(state, listed, consensus=record.consensus)
+            if canonical_hash(recomputed)==canonical_hash(record.state_after):
+                for change in changes.values():
+                    _trace(state,record,"consensus",change,source="sealed_consensus_replay")
+            else:
+                for track in (("consensus","power") if state.split else ("consensus",)):
+                    old=getattr(state,track)
+                    for node,value in record.state_after[track]["reputation"].items():
+                        state.reputation_events.append({
+                            "node_id":node, "kind":record.kind, "record_hash":record.hash,
+                            "track":track, "source":"sealed_snapshot", "operation":"snapshot_without_ema",
+                            "alpha_used":None, "signal":None, "mechanism":old.mechanism,
+                            "before":round(old.get(node),6), "after":round(value,6),
+                        })
+        state.restore(record.state_after)
         for nid in state.node_ids:
             history = state.presence.setdefault(nid, [])
             history.append(listed.get(nid) is not None)
             del history[:-max(1, state.config.availability_window)]
         state.last_leader = record.leader
         state.rotation += 1
-    elif record.kind == "void":
+    elif record.kind in ("void","penalty"):
         for nid, _ in record.penalties:
-            _punish(state, nid)
-        state.last_leader = record.leader
-        state.rotation += 1
-    elif record.kind == "penalty":
-        for nid, _ in record.penalties:
-            _punish(state, nid)
+            _punish(state, record, nid)
+        if record.kind == "void":
+            state.last_leader = record.leader
+            state.rotation += 1
     elif record.kind in ("oracle", "calibration"):
         if record.kind == "calibration":
             listed = record.responses_map()
@@ -581,24 +622,20 @@ def apply_record(state: NetworkState, record: RoundRecord) -> None:
                 del history[:-max(1, state.config.availability_window)]
         alpha = state.config.oracle_alpha
         for nid, answer in record.graded:
+            trackers = (("consensus",state.consensus),)
+            if state.split:
+                trackers += (("power",state.power),)
+            if state.config.consensus_mode == "distance" and answer is None:
+                for track,tracker in trackers:
+                    _trace(state,record,track,tracker.skip(nid),source="applied_record")
+                continue
+            exact = normalize(answer) == normalize(record.expected)
             if state.config.consensus_mode == "distance":
-                if answer is None:
-                    state.consensus.skip(nid)
-                    if state.split:
-                        state.power.skip(nid)
-                    continue
-                if state.config.validation_score == "exact":
-                    signal = 1.0 if normalize(answer) == normalize(record.expected) else 0.0
-                else:
-                    signal = 1.0 - relative_distance(answer, record.expected)
-                state.consensus.update(nid, signal, alpha=alpha, ground_truth=True)
-                if state.split:
-                    state.power.update(nid, signal, alpha=alpha, ground_truth=True)
+                signal = float(exact) if state.config.validation_score == "exact" else 1.0 - relative_distance(answer, record.expected)
             else:
-                correct = answer is not None and normalize(answer) == normalize(record.expected)
-                state.consensus.update(nid, correct, alpha=alpha, ground_truth=True)
-                if state.split:
-                    state.power.update(nid, correct, alpha=alpha, ground_truth=True)
+                signal = answer is not None and exact
+            for track,tracker in trackers:
+                _trace(state,record,track,tracker.update(nid,signal,alpha=alpha,ground_truth=True),source="applied_record")
 
 
 def replay(records: Iterable[RoundRecord], node_ids: Iterable[str], config: ProtocolConfig) -> NetworkState:

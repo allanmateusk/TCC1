@@ -39,6 +39,7 @@ class Replica:
         self.members: list[str] = list(ids)
         self.ledger = Ledger()
         self.state = NetworkState(ids, config)
+        self.state.trace_reputation()
 
     @property
     def head(self) -> str:
@@ -115,4 +116,6 @@ class Replica:
             "members": self.members,
             "consensus": self.state.consensus.weights(),
             "power": self.state.power.weights(),
+            "reputation_trace_round": self.state.trace_round,
+            "reputation_events": [e for e in self.state.reputation_events or () if e["node_id"]==self.node_id],
         }

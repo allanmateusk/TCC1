@@ -240,6 +240,23 @@ que a GPU foi desligada apenas porque o cliente pediu a parada. Somente
 resultados reais, aprovados e recuperados com hash verificado contam como
 producao. O CI valida o roteiro HTTP de 50 rodadas no C13 com substituto, sem inferencia BF16 nem chamada real ao R2.
 
+## Telemetria de EMA aplicada
+
+alpha_used de per_node.csv informa apenas a taxa de uma unica operacao de
+reputacao de consenso aplicada naquela rodada. Fica vazio se nenhuma taxa
+foi usada, se a reputacao veio de snapshot nao confirmado pelo algoritmo ou
+se houve mais de uma operacao (por exemplo, consenso e oraculo na mesma
+rodada). Zero fica reservado a uma atualizacao que realmente usou zero.
+
+reputation-updates.jsonl preserva a ordem real por rodada e por no,
+com trilha de consenso/poder, origem, tipo e hash do registro, sinal,
+reputacao anterior e posterior. O consenso tem replay pelo algoritmo
+autoritativo, checado contra o snapshot selado antes de registrar o alfa.
+O oraculo e a genese registram a taxa retornada na propria atualizacao.
+Omissao em modo distancia e skip com alfa e sinal nulos; oraculo bloqueado
+nao aplica uma atualizacao e continua registrado em audit-events.jsonl.
+Um snapshot divergente e sinalizado, nunca apresentado como EMA.
+
 ## Pilotos sinteticos locais (separados da campanha)
 
 O [Terraform local Docker](local-docker/README.md) e seus testes empacotam

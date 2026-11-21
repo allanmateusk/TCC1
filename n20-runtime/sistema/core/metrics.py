@@ -175,6 +175,7 @@ class MetricsLogger:
         overwrite: bool = False,
         row_sync: bool = True,
         git_sha: Optional[str] = None,
+        resume_prefix_rounds: int | None = None,
     ) -> None:
         if not overwrite and os.path.exists(output_dir):
             raise FileExistsError(
@@ -187,28 +188,66 @@ class MetricsLogger:
         self.experiment_id = experiment_id or _generate_id()
         self.per_node_rows: list[dict] = []
         self.round_rows: list[dict] = []
+        resume = resume_prefix_rounds is not None
+        prior_leadership = []
+        prior_nodes = set()
+        if resume:
+            if not overwrite or type(resume_prefix_rounds) is not int or resume_prefix_rounds<1:
+                raise ValueError("A verified, existing prefix is required")
+            def existing(name, fields):
+                with open(os.path.join(output_dir,name), encoding="utf-8", newline="") as stream:
+                    reader=csv.DictReader(stream)
+                    if reader.fieldnames != fields:
+                        raise ValueError("Resume CSV schema does not match")
+                    return list(reader)
+            self.per_node_rows=existing("per_node.csv", PER_NODE_FIELDS)
+            self.round_rows=existing("rounds.csv", ROUND_FIELDS)
+            prior_leadership=existing("leadership.csv", LEADERSHIP_FIELDS)
+            prior_nodes={r["node_id"] for r in existing("reputation_history.csv", HISTORY_FIELDS)
+                         if r["checkpoint"]=="0"}
+            if [int(r["round_index"]) for r in self.round_rows]!=list(range(resume_prefix_rounds)):
+                raise ValueError("Resume prefix ends on a different round")
+            for row in self.per_node_rows:
+                row["latency_ms"]=int(row["latency_ms"])
+                row["answered"]=int(row["answered"])
+                row["reputation_after"]=float(row["reputation_after"])
+            for row in self.round_rows:
+                for name in ("consensus_correct","majority_correct"):
+                    row[name]=int(row[name])
 
         # --- Gravação incremental --------------------------------------
         # Abrimos os três CSVs de série temporal já no início e escrevemos
         # cada linha assim que a rodada é processada, sincronizando em disco.
         # Assim nenhuma rodada já concluída se perde numa interrupção.
         self._per_node_stream = _CsvStream(
-            os.path.join(output_dir, "per_node.csv"), PER_NODE_FIELDS, sync=row_sync
+            os.path.join(output_dir, "per_node.csv"), PER_NODE_FIELDS, sync=row_sync, append=resume
         )
         self._round_stream = _CsvStream(
-            os.path.join(output_dir, "rounds.csv"), ROUND_FIELDS, sync=row_sync
+            os.path.join(output_dir, "rounds.csv"), ROUND_FIELDS, sync=row_sync, append=resume
         )
         self._history_stream = _CsvStream(
-            os.path.join(output_dir, "reputation_history.csv"), HISTORY_FIELDS, sync=row_sync
+            os.path.join(output_dir, "reputation_history.csv"), HISTORY_FIELDS, sync=row_sync, append=resume
         )
         # Nós cujo checkpoint 0 (reputação inicial) já foi escrito no histórico.
-        self._history_seed_written: set[str] = set()
+        self._history_seed_written: set[str] = prior_nodes
         self._row_sync = row_sync
-        self.leadership_rows: list[dict] = []
-        self._leadership_stream: Optional[_CsvStream] = None
+        self.leadership_rows: list[dict] = prior_leadership
+        self._leadership_stream: Optional[_CsvStream] = (
+            _CsvStream(os.path.join(output_dir,"leadership.csv"), LEADERSHIP_FIELDS,sync=row_sync,append=True)
+            if resume else None)
         self._closed = False
+        self._reputation_events_started = resume
 
     # ------------------------------------------------------------------
+    def record_reputation_events(self, round_index: int, events: dict[str,list]) -> None:
+        path = os.path.join(self.output_dir,"reputation-updates.jsonl")
+        with open(path, "a" if self._reputation_events_started else "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"round_index":round_index,"nodes":events},ensure_ascii=True) + chr(10))
+            stream.flush()
+            if self._row_sync:
+                os.fsync(stream.fileno())
+        self._reputation_events_started=True
+
     def record_leadership(self, row: dict) -> None:
         """Linha de ``leadership.csv`` (arquivo criado só quando usado)."""
         if self._leadership_stream is None:
@@ -264,7 +303,7 @@ class MetricsLogger:
             "delta": round(rep_update.delta, 6),
             "reward": round(rep_update.reward, 6),
             "punishment": round(rep_update.punishment, 6),
-            "alpha_used": round(rep_update.alpha_used, 6),
+            "alpha_used": round(rep_update.alpha_used, 6) if rep_update.alpha_used is not None else "",
             "mechanism": rep_update.mechanism,
             "weight_used": round(weight_used, 6),
             "consensus_weighted_result": (
@@ -509,13 +548,14 @@ class _CsvStream:
     perca as rodadas já processadas.
     """
 
-    def __init__(self, path: str, fieldnames: list[str], sync: bool = True) -> None:
+    def __init__(self, path: str, fieldnames: list[str], sync: bool = True, *, append: bool = False) -> None:
         self.path = path
         self._sync_each = sync
-        self._fh = open(path, "w", newline="", encoding="utf-8")
+        self._fh = open(path, "a" if append else "w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._fh, fieldnames=fieldnames)
-        self._writer.writeheader()
-        self._sync()
+        if not append:
+            self._writer.writeheader()
+            self._sync()
 
     def write(self, row: dict) -> None:
         self._writer.writerow(row)
