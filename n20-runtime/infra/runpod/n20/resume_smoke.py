@@ -1,9 +1,8 @@
 
-"""Offline proof: actually restart 20 HTTP stand-ins in the same UUID after round two."""
+"""Offline proof: actually restart 20 HTTP stand-ins at a sealed round frontier."""
 from __future__ import annotations
 
 import argparse
-import asyncio
 from collections import Counter
 from contextlib import contextmanager
 import csv
@@ -19,17 +18,17 @@ from . import artifact_store, benchmark, checkpoint, integration_smoke as fixtur
 from sistema.orchestrator import run as orchestrator
 
 
-def bound_frontier(work, expected_id):
+def bound_frontier(work, expected_id, scenario="pilot", cut=3):
     cfg=orchestrator.load_config(str(work/"config.yaml"))
     i=checkpoint.Identity(**cfg["checkpoint_identity"])
-    if i.run_id!=expected_id or i.scenario_id!="pilot" or i.rounds!=5:
+    if i.run_id!=expected_id or i.scenario_id!=scenario:
         raise ValueError("Offline restart identity mismatch")
     core={k:v for k,v in cfg.items() if k!="checkpoint_identity"}
     if artifact_store.sha(artifact_store.json_bytes(core))!=i.config_sha256:
         raise ValueError("Offline restart effective configuration mismatch")
     marker,_=checkpoint.CheckpointStore(work,i).recover()
-    if marker is None or marker["round_index"]!=1:
-        raise ValueError("Offline restart fixture requires the exact round-two marker")
+    if marker is None or marker["round_index"]!=cut-2:
+        raise ValueError("Offline restart fixture requires the exact cut frontier")
     checkpoint.verify_log_prefixes(work,marker)
     return cfg, marker
 
@@ -91,21 +90,18 @@ def _normalize_csv(root,name):
         return [{k:v for k,v in row.items() if k not in remove} for row in csv.DictReader(h)]
 
 
-def restored_coordinator(args):
-    work=Path(args.config).resolve().parent
-    config,marker=bound_frontier(work,args.run_id)
-    asyncio.run(orchestrator.run_dynamic_experiment(config,offline_test_resume=marker))
-
-
-def main_proof(root):
+def main_proof(root, scenario="pilot", cut=3):
     root=root.resolve()
     if root.is_relative_to(benchmark.ROOT.parent.resolve()):
         raise ValueError("Offline proof output must be outside the Git worktree")
     root.mkdir(exist_ok=False)
+    nr=5 if scenario=="pilot" else 50
+    if not 2 <= cut < nr:
+        raise ValueError("Cut must leave a sealed prefix and unfinished suffix")
     _ports_are_clear()
-    fixture.test_end_to_end(root/"reference",capture_checkpoints=True)
+    fixture.test_end_to_end(root/"reference",scenario_filter=scenario,capture_checkpoints=True)
     _ports_are_clear()
-    fixture.test_end_to_end(root/"cut",capture_checkpoints=True,fail_before=2)
+    fixture.test_end_to_end(root/"cut",scenario_filter=scenario,capture_checkpoints=True,fail_before=cut-1)
     def get_run(kind):
         parent=root/kind
         rid=json.loads((parent/"integration-report.json").read_text(encoding="utf-8"))[0]["checkpoint_run_id"]
@@ -114,7 +110,7 @@ def main_proof(root):
     work,rid=get_run("cut")
     with _claim(work):
         try:
-            bound_frontier(work,"0"*32)
+            bound_frontier(work,"0"*32,scenario,cut)
         except ValueError:
             pass
         else:
@@ -126,19 +122,21 @@ def main_proof(root):
             pass
         else:
             raise AssertionError("Concurrent or repeated restart was accepted")
-        _,marker=bound_frontier(work,rid)
+        cfg,marker=bound_frontier(work,rid,scenario,cut)
+        identity=checkpoint.Identity(**cfg["checkpoint_identity"])
+        _,digest=checkpoint.CheckpointStore(work,identity).recover()
         observed=_calls(work,rid)
         counts=Counter((r["phase"],r["round"]) for r in observed)
-        if counts!={("initial",1):20,("initial",2):20,("initial",3):20}:
+        if counts!={("initial",r):20 for r in range(1,cut+1)}:
             raise RuntimeError("Unexpected number of real stand-in invocations before the cut")
-        archived=quarantine_prefix(work,marker)
+        archived=work/f"interrupted-{digest[:16]}"
         _ports_are_clear()
         profile,cases=benchmark.load_profile()
-        config,item=benchmark.scenario_args(profile,cases["pilot"],0)
-        item["checkpoint_capture"]={"run_id":rid,"git_sha":"8"*40,"tasks_sha256":profile["task_sha256"]}
+        config,item=benchmark.scenario_args(profile,cases[scenario],0)
+        item["checkpoint_capture"]={"run_id":rid,"git_sha":"8"*40,"tasks_sha256":profile["task_sha256"],"scenario_id":scenario}
         worker=benchmark.worker
         children=[]
-        deadline=time.monotonic()+150
+        deadline=time.monotonic()+(150 if nr==5 else 780)
         def check():
             if time.monotonic()>deadline:
                 raise TimeoutError("Timed out starting restored mock nodes")
@@ -146,25 +144,22 @@ def main_proof(root):
             if command[1:3]==["-m","uvicorn"]:
                 port=command[command.index("--port")+1]
                 command=[command[0],"-B","-m",fixture.__spec__.name,"test-node","--port",port,"--restore"]
-            elif command[1:3]==["-m","sistema.orchestrator.run"]:
-                command=[command[0],"-B","-m","infra.runpod.n20.resume_smoke","coordinator",
-                         "--run-id",rid,"--config",command[-1]]
             p=subprocess.Popen(command,*a,**k)
             children.append(p)
             return p
         with patch.object(worker,"subprocess",SimpleNamespace(Popen=replace,TimeoutExpired=subprocess.TimeoutExpired,
                                                                STDOUT=subprocess.STDOUT)):
             worker.execute_scenario(work,item,config,root/"cut"/"no-model-files",["mock0","mock1"],
-                                    check,lambda *_args,**_opts:None)
+                                    check,lambda *_args,**_opts:None,restart_digest=digest)
         if len(children)!=21 or any(p.poll() is None for p in children):
             raise RuntimeError("Restart did not execute and clean up 20 new mock nodes and one coordinator")
         _ports_are_clear()
-        outcome=fixture.capture_outcome(work,profile,cases["pilot"],item)
+        outcome=fixture.capture_outcome(work,profile,cases[scenario],item)
         after=_calls(work,rid)
         reference=_calls(ref,ref_id)
-        target={("initial",1):20,("initial",2):20,("initial",3):20,("resume",4):20,("resume",5):20}
-        if (Counter((r["phase"],r["round"]) for r in after)!=target or len(reference)!=100
-            or len({(r["round"],r["node"]) for r in after})!=100):
+        target={("initial" if r<=cut else "resume",r):20 for r in range(1,nr+1)}
+        if (Counter((r["phase"],r["round"]) for r in after)!=target or len(reference)!=nr*20
+            or len({(r["round"],r["node"]) for r in after})!=nr*20):
             raise RuntimeError("Duplicate or missing physical model invocation")
         if {(r["round"],r["node"],r["seed"]) for r in after}!={(r["round"],r["node"],r["seed"]) for r in reference}:
             raise RuntimeError("Reference task assignments differ")
@@ -191,14 +186,16 @@ def main_proof(root):
         final,_=checkpoint.CheckpointStore(work,checkpoint.Identity(**final_cfg["checkpoint_identity"])).recover()
         ref_cfg=orchestrator.load_config(str(ref/"config.yaml"))
         clean,_=checkpoint.CheckpointStore(ref,checkpoint.Identity(**ref_cfg["checkpoint_identity"])).recover()
-        if final["round_index"]!=4 or final["replicas"]!=clean["replicas"] or (
+        if final["round_index"]!=nr-1 or final["replicas"]!=clean["replicas"] or (
             final["groups"],final["next_gid"])!=(clean["groups"],clean["next_gid"]):
             raise RuntimeError("Final restored states or coordinator layout differs")
         q=json.loads((archived/"archive-proof.json").read_bytes())
         if any(artifact_store.sha((archived/name).read_bytes())!=sha for name,sha in q.items()):
             raise RuntimeError("Quarantined attempt changed")
         result={"status":"verified_offline_restart","model_is_stand_in":True,"same_uuid":rid,
-                "cut_after_model_calls":len(observed),"new_calls_round_three":0,"new_calls_rounds_four_five":40,
+                "cut_after_model_calls":len(observed),"scenario_id":scenario,"cut_round":cut,
+                "new_calls_replayed_round":0,"new_calls_after_replayed_round":(nr-cut)*20,
+                **({"new_calls_round_three":0,"new_calls_rounds_four_five":40} if nr==5 and cut==3 else {}),
                 "physical_calls_restarted":len(after),"physical_calls_reference":len(reference),
                 "matching_ledger_and_replica_heads":20,"matching_semantic_logs":len(checkpoint.LOGS),
                 "matching_analytical_summary":True,
@@ -213,14 +210,10 @@ def main():
     sub=cli.add_subparsers(dest="mode",required=True)
     proof=sub.add_parser("run")
     proof.add_argument("--output",type=Path,required=True)
-    coordinator=sub.add_parser("coordinator",help=argparse.SUPPRESS)
-    coordinator.add_argument("--config",required=True)
-    coordinator.add_argument("--run-id",required=True)
+    proof.add_argument("--scenario",choices=("pilot","C13"),default="pilot")
+    proof.add_argument("--cut-round",type=int,default=3)
     args=cli.parse_args()
-    if args.mode=="coordinator":
-        restored_coordinator(args)
-    else:
-        main_proof(args.output)
+    main_proof(args.output,args.scenario,args.cut_round)
 
 
 if __name__=="__main__":

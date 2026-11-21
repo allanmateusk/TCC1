@@ -137,7 +137,7 @@ def _groups_by_head(states: dict[str, dict]) -> dict[str, list[str]]:
     return groups
 
 
-async def run_dynamic_experiment(config: dict, *, offline_test_resume=None) -> dict:
+async def run_dynamic_experiment(config: dict, *, resume_marker=None) -> dict:
     """Rodadas conduzidas pelos próprios nós (líder eleito pela cadeia).
 
     O coordenador não decide nada do protocolo: pergunta a um nó de cada cópia
@@ -166,31 +166,33 @@ async def run_dynamic_experiment(config: dict, *, offline_test_resume=None) -> d
     output_dir = config.get("output_dir", os.path.join("sistema", "results", "experimento"))
     graph = build_graph(node_ids, config.get("topology", "kregular"), degree=int(config.get("degree", 4)), seed=int(config.get("seed", 0)))
 
-    if offline_test_resume is not None and (not config.get("checkpoint_identity")
-        or config["checkpoint_identity"].get("scenario_id")!="pilot"):
-        raise ValueError("Offline restart proof supports only the checkpointed pilot")
-    cursor = 0 if offline_test_resume is None else offline_test_resume["round_index"]+1
-    logger = MetricsLogger(output_dir, experiment_id=config.get("experiment_id"), overwrite=True,
-                           resume_prefix_rounds=cursor or None)
+    if resume_marker is not None and not config.get("checkpoint_identity"):
+        raise ValueError("Recovery requires a checkpoint-bound scenario")
+    cursor = 0 if resume_marker is None else resume_marker["round_index"]+1
     campaign = config.get("campaign_plan")
     checkpoint_identity = config.get("checkpoint_identity")
     if checkpoint_identity:
         from infra.runpod.n20.artifact_store import json_bytes, sha
-        from infra.runpod.n20.checkpoint import CheckpointStore, Identity, capture_log_prefixes
+        from infra.runpod.n20.checkpoint import CheckpointStore, Identity, capture_log_prefixes, verify_log_prefixes
         store = CheckpointStore(Path(output_dir), Identity(**checkpoint_identity))
         if sha(json_bytes({k:v for k,v in config.items() if k != 'checkpoint_identity'})) != store.identity.config_sha256:
             raise ValueError('Checkpoint effective configuration differs from its identity')
         checkpoint_token = os.getenv("N20_CHECKPOINT_TOKEN")
         if not checkpoint_token or os.getenv("N20_CHECKPOINT_RUN_ID") != store.identity.run_id:
-            raise ValueError("Missing checkpoint authorization scoped to this pilot")
+            raise ValueError("Missing checkpoint authorization scoped to this run")
     gid_of: dict[str, int] = {n: 0 for n in node_ids}
     next_gid = 1
-    if offline_test_resume is not None:
+    if resume_marker is not None:
         prior,_ = store.recover()
-        if prior != offline_test_resume or not 0<cursor<rounds:
-            raise ValueError("Offline recovery cursor is not the latest committed marker")
+        if prior != resume_marker or not 0<cursor<rounds:
+            raise ValueError("Recovery cursor is not the latest committed marker")
+        verify_log_prefixes(Path(output_dir),prior)
         gid_of=dict(prior["groups"])
         next_gid=prior["next_gid"]
+    elif checkpoint_identity and store.recover()[0] is not None:
+        raise ValueError("Refusing to overwrite an existing checkpointed attempt")
+    logger = MetricsLogger(output_dir, experiment_id=config.get("experiment_id"), overwrite=True,
+                           resume_prefix_rounds=cursor or None)
     states: dict[str, dict] = {}
 
     async def read_states(client: httpx.AsyncClient) -> dict[str, dict]:
@@ -204,7 +206,7 @@ async def run_dynamic_experiment(config: dict, *, offline_test_resume=None) -> d
         async with httpx.AsyncClient() as client:
             await wait_for_nodes(client, nodes)
             states = await read_states(client)
-            if offline_test_resume is not None and (set(states)!=set(node_ids) or any(
+            if resume_marker is not None and (set(states)!=set(node_ids) or any(
                 states[n]["head"]!=prior["replicas"][n]["head"] or states[n]["members"]!=prior["replicas"][n]["members"]
                 for n in node_ids)):
                 raise RuntimeError("Restored HTTP nodes do not match the checkpoint")
@@ -526,7 +528,11 @@ def main(argv: list[str] | None = None) -> None:
     config = load_config(args.config)
     if config.get("orchestration", "dynamic") != "dynamic":
         raise ValueError("Somente a orquestração dinâmica é suportada.")
-    asyncio.run(run_dynamic_experiment(config))
+    marker=None
+    if os.getenv("N20_RESTORE_FRONTIER"):
+        from infra.runpod.n20.local_recovery import load_request
+        marker=load_request(config["output_dir"])
+    asyncio.run(run_dynamic_experiment(config,resume_marker=marker))
 
 
 if __name__ == "__main__":

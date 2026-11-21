@@ -44,6 +44,7 @@ class DedicatedModel:
                 raise ValueError("Node inference cache belongs to another node, scenario or model")
             db.execute("INSERT OR IGNORE INTO meta VALUES (1,?)", (self.config,))
             db.execute("CREATE TABLE IF NOT EXISTS generations (round_index INTEGER PRIMARY KEY, node_id TEXT NOT NULL, task_id TEXT NOT NULL, question_hash TEXT NOT NULL, seed INTEGER NOT NULL UNIQUE, answer TEXT NOT NULL, text TEXT NOT NULL, latency_ms INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS generation_intents (round_index INTEGER PRIMARY KEY, node_id TEXT NOT NULL, task_id TEXT NOT NULL, question_hash TEXT NOT NULL, seed INTEGER NOT NULL UNIQUE)")
             db.execute("CREATE TABLE IF NOT EXISTS responses (round_index INTEGER PRIMARY KEY, answer TEXT NOT NULL, base_node TEXT NOT NULL)")
             db.commit()
 
@@ -100,6 +101,11 @@ class DedicatedModel:
                     raise ValueError("Repeated node/round request contains conflicting task or seed")
                 return {"answer": json.loads(old[4]), "text": old[5], "latency_ms": old[6]}
             model = self.ensure_loaded()
+            if db.execute("SELECT 1 FROM generation_intents WHERE round_index=?", (round_index,)).fetchone():
+                raise RuntimeError("Model call interrupted before result commit; refusing automatic duplicate")
+            db.execute("INSERT INTO generation_intents VALUES (?,?,?,?,?)",
+                       (round_index, self.node_id, task_id, digest, seed))
+            db.commit()
             started = time.perf_counter()
             answer, text = model.sample(question, temperature=self.temperature, top_p=self.top_p, seed=seed)
             latency = int((time.perf_counter() - started) * 1000)

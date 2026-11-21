@@ -107,6 +107,7 @@ class CheckpointStore:
             raise ValueError("Checkpoint must be bound to the protected run directory")
         self.root = run_dir.resolve(strict=True)
         self.identity = identity
+        self._writer_frontier = None
 
     def _file(self, i):
         return self.root / f"checkpoint-{i:02d}.json"
@@ -155,7 +156,9 @@ class CheckpointStore:
 
     def publish(self, round_index, *, replicas, groups, next_gid, log_prefixes):
         """Validate a prepared boundary then publish once; identical replays are no-ops."""
-        prior, prev_digest = self.recover()
+        # Only the fenced coordinator uses this instance to append. A new
+        # process always scans the immutable chain independently.
+        prior, prev_digest = self._writer_frontier or self.recover()
         i = 0 if prior is None else prior["round_index"] + 1
         value = dict(schema=SCHEMA, identity=asdict(self.identity), round_index=round_index,
                      previous=prev_digest if round_index == i else (prior or {}).get("previous"),
@@ -172,6 +175,7 @@ class CheckpointStore:
         if len(data) > MAX_CHECKPOINT:
             raise ValueError("Checkpoint too large")
         write_atomic(self._file(i), data)
+        self._writer_frontier=(value,checksum)
         return checksum
 
 

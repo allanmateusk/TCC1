@@ -1,101 +1,77 @@
-# N20: durable round checkpoint capture
+# N20: checkpoints and restart qualification
 
-The HTTP pilot can capture verified checkpoints after each completed round.
-The official 50-round runner does not enable checkpoints, and its CLI has
-no resume option. A separate localhost stand-in harness tests actual restart. This change does not start a server or contact R2.
+The same dedicated worker can seal both the 20 × 5 pilot and an official
+20 × 50 case. The full restart proof below uses a deterministic CPU stand-in
+in the actual HTTP node/coordinator processes; it is not a production or
+cloud qualification.
 
-## Covered boundary
+## Durable frontier
 
-At each zero-based round boundary, a record names the full execution identity
-(external run ID, internal experiment, scenario, seed, Git/model revision and
-digests of effective config, tasks and audit plan). It also carries 20 replica
-chains and states, membership and coordinator group allocation, and the size
-and SHA-256 of each committed log prefix. Each replica chain must extend its
-previous committed prefix and have one terminal round/void/calibration record
-per completed round. The checkpoint file is the commit marker: its name first
-becomes visible by atomic publication after data fsync. The highest contiguous
-verified file is the restart frontier; no CSV length or partial temp file is
-treated as completion. Replayed state uses the actual protocol Ledger and
-apply_record to reproduce reputation trackers, presence, leader and rotation.
-Membership is restored from the checkpoint separately because the ledger alone
-does not reproduce refusals and forks.
+After ordinary commit and any oracle/calibration, the worker verifies
+loopback-only snapshots from all 20 nodes and checks the observed heads and
+memberships. The checkpoint contains the complete replica chains and derived
+state, membership and group allocation plus hashes and byte offsets of six
+committed log prefixes (including applied-alpha events). It binds the run UUID,
+scenario, seed, Git/model revisions, task fixture, schedule and exact effective
+configuration. Atomic publication happens only after the logs have been
+flushed. The highest contiguous validated marker is authoritative; neither a
+CSV tail nor a failed attempt's outputs can advance it.
 
-The store assumes one fenced writer and local/durable filesystem semantics
-including atomic hard links and directory fsync on POSIX. Validate these on
-the chosen mount before claiming resilience to host loss. Untrusted workers
-must not be able to overwrite committed checkpoints. Checksum chaining detects
-corruption, not malicious replacement by an actor with access to the whole tree.
+The coordinator only caches its own most recently sealed marker while it is
+the fenced writer. A new process independently scans the immutable chain.
+The store requires a filesystem with real locks, hard-link atomic publication
+and sync semantics. This local test does not qualify a provider volume.
 
-## Pilot capture and remaining resume changes
+## Safe local continuation
 
-1. Pilot capture reads the 20 exact replicas over a loopback-only endpoint.
-   The worker creates an ephemeral per-run authorization token; it is never
-   saved in the checked-in config or result. Only export, not restore, is
-   supported on that endpoint. Wait for ordinary commit and oracle/calibration;
-   compare the exported head and membership to the coordinator's observed state.
-2. Hash the six already-written logs, including the EMA update trace, after the
-   complete audit event. Publish the immutable marker only after verification.
-   The highest marker, not any CSV tail, defines progress. Failed or torn
-   suffixes and committed node SQLite entries remain local. The log writer
-   uses overwrite mode on normal runs; the offline harness alone can append from a verified prefix.
-3. In a future explicit recovery entry point, validate the mount and exclusive
-   lease, verify the committed prefixes, reconstruct and install all replicas
-   from stored chains/config and memberships, restore coordinator counters and
-   append at the next round. Reconstruct or clear process-local request memos
-   at the exact boundary; hold the previous attempt until its provider resource
-   is confirmed stopped so stale processes cannot write afterward.
-4. Preserve each node's transactional SQLite under the same external run ID
-   and immutable request identity. For a partially executed next round,
-   consume only matching committed SQLite rows and never regenerate known
-   responses. A GPU call lost before its database commit is ambiguous, so
-   abort or explicitly classify it separately if no-repeat is a hard constraint.
-   Never reuse another run's rows.
-5. Extend the offline HTTP restart coverage to interruptions after
-   per-node generation, subset commit, subset oracle, CSV suffix and checkpoint
-   publication. Compare with an uninterrupted run and prove the raw model
-   invocation count, ledger hashes, group membership, reputation and logs.
-   Then benchmark storage and replay overhead for all 50 rounds. The immutable
-   full-chain format favors verification over storage efficiency. The limit
-   is 50 rounds per series and 16 MiB per checkpoint.
+1. The old attempt must be fenced and its loopback ports free. The Linux live
+   path is also single-writer locked. It requires the exact original durable
+   run directory/model path and a protected independent controller permit
+   from another OS user, outside the code and data volumes. The short-lived
+   permit binds the existing resource, run, case, Git/model revisions and the
+   precise checkpoint digest. It attests fencing; the worker cannot prove
+   provider-side fencing by itself.
+2. Before changing active files, verify the checkpoint chain and prefixes plus
+   all 20 SQLite databases. Check UUID, node/model identity, task ID and text
+   hash, deterministic per-node seed, and consistency with committed and at
+   most one uncommitted round. A cache cannot be silently created or reused
+   from another run. A completed result is not restartable.
+3. Preserve the previous logs and their hashes in a new immutable quarantine
+   directory. Recover only verified prefixes and rebuild replicas plus
+   coordinator groups. Pass only the exact bound marker to child processes.
+   Normal startup refuses to overwrite an existing checkpointed scenario.
+4. New generations first commit a SQLite intent with FULL synchronization,
+   then commit a separate result after the model returns. A matching stored
+   result is reused. A persisted intent without its result is ambiguous:
+   abort rather than call the model again. This deliberately favors refusal
+   over duplicates; it is not an exactly-once claim about a GPU call whose
+   result cannot be recovered. The old format without intents is not
+   automatically eligible for restart.
 
-Local fixture tests cover the substrate and actual protocol replay.
-To verify pilot capture without model weights, Docker, a GPU or cloud, use a
-fresh output outside Git:
+## Evidence and deployment boundary
 
-    python -m infra.runpod.n20.integration_smoke run --checkpoint --output /new/offline-test
-    python -m infra.runpod.n20.integration_smoke run --checkpoint --interrupt-before-checkpoint 2 --output /new/interrupted-test
+Run into fresh output outside Git, with no model weights, Docker, GPU or R2:
 
-The second command stops the stand-in coordinator after writing the third
-round's rows and before sealing that marker. The test expects only two
-verified checkpoints and 20 already-durable synthetic generations from the
-uncommitted next round. It does not restart workers or claim resume.
+    python -m infra.runpod.n20.resume_smoke run --output /new/offline-pilot-restart
+    python -m infra.runpod.n20.resume_smoke run --scenario C13 --cut-round 17 --output /new/offline-c13-restart
 
+The second test runs a clean C13 reference, captures a separate attempt of
+the same 20 × 50 configuration, cuts before marker 17 after that round's 20
+generation/response rows are durable, stops all old HTTP processes, and
+restarts through the same worker and coordinator entry points. The
+stand-in's internal append-and-sync log counts actual model calls, not merely
+database rows: 340 before cut, zero new at round 17, and 660 new after;
+1,000 total exactly matching the clean reference. All 20 final ledger/replica
+states, six semantic logs and the analytical summary are compared, ignoring
+only measured latency and unstable traversal-depth columns. The proof rejects
+a wrong UUID and same-attempt reentry.
 
-## Offline restart comparison
-
-Run only in a fresh directory outside Git:
-
-    python -m infra.runpod.n20.resume_smoke run --output /new/offline-restart
-
-The harness runs a clean reference, then cuts a second pilot before marking
-round 3 and stops the old service processes. It archives the first attempt's
-logs and hashes, reinstates their two-round verified prefixes, restores the
-20 replica chains/state/membership and group counter, and starts fresh
-localhost stand-in processes under the same UUID and SQLite files. The
-coordinator resumes at round 3, not at round 4: the third round's stored
-generation/response rows are reused while its protocol is executed again.
-
-A separate append-and-fsync log inside each stand-in sample() counts physical
-calls, including duplicates if they occur; the final SQL count alone would
-not prove that property. A pass requires 60 first-attempt calls, zero new
-calls in round 3, 40 in rounds 4-5, and 100 in the clean run. It checks all
-20 final ledgers and replayable replica states, the analytical summary,
-audit and EMA history, and stable columns in the metric streams. Only
-measured latency and schedule-dependent traversal hops are excluded from
-the reference comparison. A mismatched UUID and a second local resume
-claim are rejected.
-
-This is not a paid-resume entry point and does not prove exactly-once if a
-model call disappears before its SQLite commit. It does not restore from
-C13 forks or a lost host, prove external fencing, or prove a real volume.
-Fail closed on ambiguous in-flight generations before qualifying real resume.
+A future provider-qualified Linux launch may use the explicit
+`--recovery-permit` path only after `TCC_N20_RECOVERY_QUALIFIED=true`,
+the separate live/official gates, and preexisting watchdog authorization.
+No GitHub Actions step sets this flag. Do not activate it without a protected
+permit issuer, genuine prior-worker fencing, independently verified durable
+filesystem and watchdog, hardware validation, and failure tests. This local
+proof does not restore a lost host, qualify cloud/provider behavior, or wire
+remote checkpoint copies into live recovery. After a final marker, verify
+final artifacts separately instead of replaying the completed run.

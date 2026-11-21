@@ -134,7 +134,7 @@ def verify_controller_arm(path, run_dir, resource_id, run_id, *, run_kind="pilot
 
 
 def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_root=None, run_id=None,
-         controller_state=None, resource_id=None):
+         controller_state=None, resource_id=None, recovery_permit=None):
     if os.getenv("TCC_LIVE_N20_APPROVED") != "true":
         raise RuntimeError("Set explicit live execution approval before running.")
     if sys.platform != "linux":
@@ -142,6 +142,8 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
     config, entry = scenario_args(profile, scenario, seed, rounds)
     if entry["run_kind"] == "official" and os.getenv("TCC_N20_OFFICIAL_QUALIFIED") != "true":
         raise ValueError("Official case disabled until the independent provider lifecycle is qualified")
+    if recovery_permit is not None and os.getenv("TCC_N20_RECOVERY_QUALIFIED") != "true":
+        raise ValueError("Real restart disabled until independent controller fencing is qualified")
     run_dir = artifact_store.durable_run(durable_root, run_id, repo=ROOT.parent)
     provider_deadline = verify_controller_arm(controller_state, run_dir, resource_id, run_id,
                                               run_kind=entry["run_kind"], scenario_id=scenario["id"])
@@ -181,10 +183,37 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
                 raise RuntimeError(f"CUDA device {i} does not support native BF16.")
         if free_gib < required_gib:
             raise RuntimeError(f"CUDA device {i}: {free_gib:.2f} GiB free, {required_gib:.2f} GiB required.")
+    from . import local_recovery
     out = run_dir
-    if entry["run_kind"]=="pilot":
-        entry["checkpoint_capture"]={"run_id":run_id,"git_sha":git_sha,"tasks_sha256":profile["task_sha256"]}
-    artifact_store.create_run_directory(out)
+    entry["checkpoint_capture"]={"run_id":run_id,"git_sha":git_sha,"tasks_sha256":profile["task_sha256"],
+                                 "scenario_id":scenario["id"]}
+    restart_digest=None
+    if recovery_permit is None:
+        artifact_store.create_run_directory(out)
+    else:
+        if out.is_symlink() or not out.is_dir():
+            raise ValueError("Recovery requires the original durable run directory")
+        restart_digest=local_recovery.external_permit(recovery_permit,out,now=time.time(),provider_deadline=provider_deadline,
+            expected={"run_id":run_id,"scenario_id":scenario["id"],"resource_id":resource_id,
+                      "git_sha":git_sha,"snapshot_revision":profile["model_revision"]})
+    with local_recovery.acquire_executor(out):
+        if restart_digest is not None:
+            local_recovery.reject_unfenced_ports(worker.URLS.values())
+            old_raw=artifact_store.read_file(out,"live-run.json")
+            old=json.loads(old_raw)
+            expected={"run_id":run_id,"scenario_id":scenario["id"],"git_sha":git_sha,
+                      "model_revision":profile["model_revision"],"experiment_id":entry["id"],"seed":seed,
+                      "run_kind":entry["run_kind"],"model_is_stand_in":False,"completed":False}
+            if any(old.get(k)!=v for k,v in expected.items()) or old.get("status") not in ("running","failed","cancelled"):
+                raise ValueError("Run lifecycle is complete or differs from the protected recovery identity")
+            artifact_store.write_atomic(out/f"live-before-recovery-{restart_digest[:16]}.json",old_raw)
+        _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha,run_id,provider_deadline,
+                      per_node_gib,required_gib,free_vram_gib,devices,torch,restart_digest)
+
+
+def _execute_live(out,entry,config,profile,scenario,seed,snapshot,rounds,git_sha,run_id,provider_deadline,
+                  per_node_gib,required_gib,free_vram_gib,devices,torch,restart_digest):
+    n=len(devices)
     check_mapping(profile, scenario, seed, out, snapshot, rounds)
     metadata = {"profile": profile, "scenario": entry, "started": datetime.now(timezone.utc).isoformat(),
                 "run_id": run_id, "experiment_id": entry["id"], "scenario_id": scenario["id"], "seed": seed,
@@ -233,7 +262,8 @@ def live(profile, scenario, seed, snapshot, out=None, rounds=None, *, durable_ro
 
     previous = {s: signal.signal(s, stop) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
-        worker.execute_scenario(out, entry, config, snapshot, devices, check, progress)
+        worker.execute_scenario(out, entry, config, snapshot, devices, check, progress,
+                                restart_digest=restart_digest)
         finalized = {**metadata, "status": "verified_local", "completed": True,
                      "verified_own_generations": entry["expected_own_generations"],
                      "finished": datetime.now(timezone.utc).isoformat()}
@@ -263,6 +293,7 @@ def main():
     run.add_argument("--durable-root", type=Path, required=True)
     run.add_argument("--run-id", required=True)
     run.add_argument("--controller-state", type=Path, required=True)
+    run.add_argument("--recovery-permit", type=Path, help="Controller-owned fence attestation for a qualified same-run restart.")
     run.add_argument("--resource-id", required=True)
     run.add_argument("--output", type=Path, help="Optional check: must equal durable-root/run-id.")
     run.add_argument("--rounds", type=int, choices=(*profile["pilot_rounds"], profile["rounds"]),
@@ -276,7 +307,8 @@ def main():
     else:
         live(profile, scenarios[args.scenario], args.seed, args.snapshot, args.output, args.rounds,
              durable_root=args.durable_root, run_id=args.run_id,
-             controller_state=args.controller_state, resource_id=args.resource_id)
+             controller_state=args.controller_state, resource_id=args.resource_id,
+             recovery_permit=args.recovery_permit)
 
 
 if __name__ == "__main__":

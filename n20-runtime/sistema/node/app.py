@@ -35,6 +35,7 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
+from pathlib import Path
 import random
 import threading
 import time
@@ -82,6 +83,13 @@ _model_lock = threading.RLock()
 
 @asynccontextmanager
 async def _lifespan(_app):
+    global _replica
+    if os.getenv("N20_RESTORE_FRONTIER"):
+        from infra.runpod.n20.local_recovery import load_request
+        from infra.runpod.n20.checkpoint import replay_replica
+        work=Path(os.environ["MODEL_CACHE_DIR"]).resolve(strict=True).parents[1]
+        marker=load_request(work)
+        _replica=replay_replica(marker["replicas"][NODE_ID],marker["round_index"],_protocol,_graph)
     if INFERENCE_MODE == "model" and os.getenv("MODEL_RUN_ID"):
         await asyncio.to_thread(lambda: _get_dedicated_backend().ensure_loaded())
     yield

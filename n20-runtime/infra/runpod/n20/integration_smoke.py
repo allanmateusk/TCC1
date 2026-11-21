@@ -33,7 +33,7 @@ class StandInModel:
         run_id=os.getenv("N20_CHECKPOINT_RUN_ID")
         if run_id:
             node=os.environ["NODE_ID"]
-            candidates=[r for r in range(5) if seed==int.from_bytes(
+            candidates=[r for r in range(int(os.environ["ROUNDS"])) if seed==int.from_bytes(
                 hashlib.sha256(f"0:{r}:{node}".encode()).digest()[:8],"big")&((1<<63)-1)]
             if len(candidates)!=1:
                 raise ValueError("Unexpected stand-in round seed")
@@ -55,13 +55,6 @@ def start_test_node(args):
         def __init__(self, **kwargs):
             super().__init__(factory=lambda:StandInModel(phase="resume" if getattr(args,"restore",False) else "initial"),
                              **kwargs)
-    if getattr(args,"restore",False):
-        from .resume_smoke import bound_frontier
-        from .checkpoint import replay_replica
-        work=Path(os.environ["MODEL_CACHE_DIR"]).resolve().parents[1]
-        _, marker = bound_frontier(work,os.environ["N20_CHECKPOINT_RUN_ID"])
-        app._replica=replay_replica(marker["replicas"][app.NODE_ID],marker["round_index"],app._protocol,app._graph)
-
     app.DedicatedModel = DedicatedTestModel
     uvicorn.run(app.app, host=args.host, port=args.port, workers=1, access_log=False)
 
@@ -155,9 +148,9 @@ def test_end_to_end(output, pilot_rounds=None, scenario_filter=None, capture_che
     from . import checkpoint
     worker = benchmark.worker
     if capture_checkpoints:
-        if scenario_filter not in (None,"pilot") or pilot_rounds not in (None,5):
-            raise ValueError("Checkpoint HTTP smoke is restricted to the stand-in pilot")
-        scenario_filter = "pilot"
+        if pilot_rounds not in (None,5):
+            raise ValueError("Invalid stand-in pilot length")
+        scenario_filter = scenario_filter or "pilot"
     elif fail_before is not None:
         raise ValueError("Simulated interruption requires checkpoint capture")
     spawned = []
@@ -174,9 +167,9 @@ def test_end_to_end(output, pilot_rounds=None, scenario_filter=None, capture_che
         if capture_checkpoints:
             rid=uuid.uuid4().hex
             work=output/rid
-            item["checkpoint_capture"]={"run_id":rid,"git_sha":"8"*40,"tasks_sha256":profile["task_sha256"]}
+            item["checkpoint_capture"]={"run_id":rid,"git_sha":"8"*40,"tasks_sha256":profile["task_sha256"],"scenario_id":scenario_id}
         work.mkdir()
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + (780 if capture_checkpoints and scenario_id!="pilot" else 300)
 
         def check():
             if time.monotonic() > deadline:

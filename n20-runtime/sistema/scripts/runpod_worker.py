@@ -154,26 +154,48 @@ def child_environment(parent):
     return {key: value for key, value in parent.items() if key.upper() in _CHILD_KEYS}
 
 
-def execute_scenario(work, entry, configuration, snapshot, devices, check, progress):
+def execute_scenario(work, entry, configuration, snapshot, devices, check, progress, *, restart_digest=None):
     specifications, config = scenario_configuration(configuration, entry, work, snapshot)
     config_path = work / "config.yaml"
     env = child_environment(os.environ)
     checkpoints = entry.get("checkpoint_capture")
+    if restart_digest is not None and not checkpoints:
+        raise ValueError("Restart requires a checkpoint-bound scenario")
     if checkpoints:
         from dataclasses import asdict
         from infra.runpod.n20.artifact_store import json_bytes, sha
         from infra.runpod.n20.checkpoint import Identity
-        if entry["run_kind"] != "pilot" or work.name != checkpoints["run_id"]:
-            raise ValueError("Checkpoint capture was qualified only for pilot")
+        if work.name != checkpoints["run_id"]:
+            raise ValueError("Checkpoint path does not match run ID")
+        scenario_id=checkpoints.get("scenario_id", "pilot")
+        if (scenario_id == "pilot") != (entry["run_kind"] == "pilot"):
+            raise ValueError("Checkpoint phase and scenario do not match")
         identity = Identity(
-            run_id=checkpoints["run_id"], experiment_id=entry["id"], scenario_id="pilot",
+            run_id=checkpoints["run_id"], experiment_id=entry["id"], scenario_id=scenario_id,
             seed=entry["semente"], rounds=entry["rounds"], git_sha=checkpoints["git_sha"],
             model_revision=configuration["model_revision"], config_sha256=sha(json_bytes(config)),
             tasks_sha256=checkpoints["tasks_sha256"], audit_sha256=sha(json_bytes(entry["audit_plan"])),
         )
         config["checkpoint_identity"]=asdict(identity)
-        env.update(N20_CHECKPOINT_TOKEN=secrets.token_hex(32),N20_CHECKPOINT_RUN_ID=identity.run_id)
-    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        env.update(N20_CHECKPOINT_TOKEN=secrets.token_hex(32),N20_CHECKPOINT_RUN_ID=identity.run_id,
+                   MODEL_RUN_ID=identity.run_id)
+    if restart_digest is None:
+        if config_path.exists():
+            raise ValueError("Cannot overwrite an existing scenario without a validated restart")
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    else:
+        from infra.runpod.n20 import local_recovery
+        from sistema.orchestrator.run import load_tasks
+        if config_path.is_symlink() or yaml.safe_load(config_path.read_text("utf-8")) != config:
+            raise ValueError("Sealed configuration differs from current worker")
+        if (work/"verified-generations.csv").exists():
+            raise ValueError("Scenario already contains finalized generation evidence")
+        scope={"model":str(snapshot),"revision":configuration["model_revision"],"quantization":configuration["quantization"],
+               "device":"cuda","dtype":configuration["dtype"],"max_new_tokens":configuration["max_new_tokens"],
+               "temperature":configuration["temperature"],"top_p":configuration["top_p"]}
+        frontier,marker=local_recovery.prepare(work,identity,load_tasks(config),scope,accepted_digest=restart_digest)
+        local_recovery.quarantine(work,marker,restart_digest)
+        env["N20_RESTORE_FRONTIER"]=json.dumps(frontier)
     children = []
     ready = {}
     with ExitStack() as stack:
@@ -188,7 +210,8 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                         [sys.executable, "-m", "uvicorn", "sistema.node.app:app",
                          "--host", "127.0.0.1", "--port", URLS[node_id].rsplit(":", 1)[1],
                          "--workers", "1", "--no-access-log"],
-                        cwd=ROOT, env=dict(env, **node_env, CUDA_VISIBLE_DEVICES=devices[gpu]),
+                        cwd=ROOT, env={**env, **node_env, "CUDA_VISIBLE_DEVICES":devices[gpu],
+                             "MODEL_RUN_ID":identity.run_id if checkpoints else node_env["MODEL_RUN_ID"]},
                         stdout=log, stderr=subprocess.STDOUT)
                     children.append(process)
                     ready[node_id] = process
@@ -218,6 +241,7 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
             children.append(coordinator)
             round_started = time.monotonic()
+            start_count=frontier["index"]+1 if restart_digest is not None else 0
             while coordinator.poll() is None:
                 check()
                 if any(process.poll() is not None for process in ready.values()):
@@ -232,15 +256,15 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
                     with rounds.open(encoding="utf-8", newline="") as stream:
                         count = sum(row.get("round_index", "").isdigit() for row in csv.DictReader(stream))
                 fields = {"rounds_completed": count}
-                if count:
-                    fields["seconds_per_round_observed"] = round((time.monotonic() - round_started) / count, 2)
+                if count>start_count:
+                    fields["seconds_per_round_observed"] = round((time.monotonic() - round_started) / (count-start_count), 2)
                 progress("running", **fields)
                 time.sleep(2)
             if coordinator.returncode:
                 raise RuntimeError("O orquestrador encerrou com erro; consulte orchestrator.log.")
         finally:
             stop_processes(children)
-    _verify_per_node(work, work / "node-models", configuration["nodes"], entry["rounds"], entry["id"],
+    _verify_per_node(work, work / "node-models", configuration["nodes"], entry["rounds"], identity.run_id if checkpoints else entry["id"],
                      configuration["model_revision"], model_path=str(snapshot),
                      quantization=configuration["quantization"], dtype=configuration["dtype"])
     if "audit_plan" in entry:
@@ -249,5 +273,5 @@ def execute_scenario(work, entry, configuration, snapshot, devices, check, progr
         from infra.runpod.n20.checkpoint import CheckpointStore, verify_log_prefixes
         frontier,_ = CheckpointStore(work,identity).recover()
         if frontier is None or frontier["round_index"] != entry["rounds"]-1:
-            raise RuntimeError("Pilot completed without a verified final checkpoint")
+            raise RuntimeError("Scenario completed without a verified final checkpoint")
         verify_log_prefixes(work,frontier)
