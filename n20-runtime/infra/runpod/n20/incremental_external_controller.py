@@ -6,6 +6,7 @@ The deployment owns ACLs and role-separated credentials outside the Pod.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import hmac
 import math
 from pathlib import Path
@@ -14,6 +15,7 @@ import time
 from . import artifact_store as store, incremental_first_live as live
 from . import incremental_first_observer as observer, incremental_first_transfer as transfer
 from . import incremental_warm_journal as warm
+from .incremental_transport import ReadbackMismatch
 
 COMMITTED="tcc-warm-controller-committed-transition/v1"
 APPROVAL="tcc-warm-flight-controller-approval/v1"
@@ -23,6 +25,8 @@ RELAY_FILE="controller-second-relay.json"
 SECOND_SEAL_FILE="controller-second-seal.json"
 FINAL_FILE="controller-two-case-terminal.json"
 QUALIFIED="tcc-warm-two-case-qualification-terminal/v1"
+FULL_FINAL_FILE="controller-full-final.json"
+FULL_VERIFIED="tcc-warm-official-full-verified/v1"
 
 
 @dataclass(frozen=True)
@@ -52,11 +56,15 @@ class Controller:
                "profile_sha256","opened_at","stop_at","hard_deadline")
         if (any(t[name]!=getattr(a,name) for name in binds)
                 or t.get("qualification_mode")!=getattr(a,"qualification_mode",None)
+                or (s.mode==warm.OFFICIAL and "qualification_mode" in t)
                 or (t["workflow_version"],t["worker_version"])!=(s.guard_version_id,s.worker_version_id)
                 or not warm._uuid(p["run_id"]) or p["run_id"]==a.batch_id):
             raise ValueError("Cold observer approval and warm scope do not match")
         pins=(p["observer_spki_sha256"],s.lease_key_sha256,s.readback_key_sha256,self.publication_spki_sha256)
-        if len(set(pins))!=4 or not all(warm._hex(k,64) for k in pins):
+        terminal=p["terminal_pub_key"]
+        terminal_pin=store.sha(observer.SPKI_ED25519+base64.urlsafe_b64decode(terminal+"=")) if terminal else None
+        if (len(set(pins))!=4 or not all(warm._hex(k,64) for k in pins)
+                or terminal_pin in pins or terminal and s.mode!=warm.OFFICIAL):
             raise ValueError("Observer, lease, readback and publication keys must be distinct")
         transfer.r2_grants.validate_config({"endpoint":self.endpoint,"bucket":"tcc",
                                              "region":"auto","prefix":"tcc/prod"},"official")
@@ -129,6 +137,8 @@ class Controller:
         return pkg
 
     def _first_entry(self):
+        if self._scope.mode!=warm.QUALIFICATION:
+            raise ValueError("Two-case release cannot be used by official-full mode")
         p=self._load(FIRST_FILE)
         if set(p)!={"observation","first_lease"}:
             raise ValueError("Missing exact protected first admission")
@@ -143,9 +153,11 @@ class Controller:
 
     def _transfer_trust(self,tr,e,guard_sha):
         p=self._scope.allocation
-        r=transfer.PinnedRelease(p.batch_id,p.resource_id,p.owner_id,p.datacenter_id,p.pod_name,p.git_sha,
-              p.profile_sha256,e["run_id"],guard_sha,self._scope.guard_instance_id,
-              self._scope.guard_version_id,p.stop_at)
+        identity=(p.batch_id,p.resource_id,p.owner_id,p.datacenter_id,p.pod_name,p.git_sha,
+                  p.profile_sha256,e["run_id"],guard_sha,self._scope.guard_instance_id,
+                  self._scope.guard_version_id,p.stop_at)
+        r=(transfer.FullCaseRelease(*identity,self._scope.digest,e["index"],e["case_deadline"])
+           if self._scope.mode==warm.OFFICIAL else transfer.PinnedRelease(*identity))
         if (type(tr) is not transfer.TransferTrust or tr.release!=r or tr.endpoint!=self.endpoint
                 or tr.openssl!=self.journal.authorities.openssl
                 or not hmac.compare_digest(store.sha(warm._key_der(tr.authority_pem)),self.publication_spki_sha256)):
@@ -224,6 +236,8 @@ class Controller:
         return relay
 
     def _second_entry(self):
+        if self._scope.mode!=warm.QUALIFICATION:
+            raise ValueError("Two-case release cannot be used by official-full mode")
         relay=self._load(RELAY_FILE)
         if set(relay)!={"readback","next_lease","committed"}:
             raise ValueError("Missing exact committed second lease")
@@ -299,3 +313,138 @@ class Controller:
         result={"readback":signed_readback,"qualified":self._sign(final,warm.LEASE)}
         self._write(FINAL_FILE,result)
         return result
+
+    def _active_full(self):
+        if self._scope.mode!=warm.OFFICIAL or self._scope.case_limit!=20:
+            raise ValueError("This entry requires independently approved full mode")
+        if self.journal.failure() is not None:
+            raise ValueError("Protected full campaign halted; stop/reconcile externally")
+        tips=self.journal.status()
+        n=len(tips)
+        if (not 1<=n<=self._scope.case_limit or [r["idx"] for r in tips]!=list(range(n))
+                or tips[-1]["receipt_sha"] is not None
+                or any(not warm._hex(r["receipt_sha"],64) for r in tips[:-1])):
+            raise ValueError("No authorized active case in the official sequence")
+        index=n-1
+        if index==0:
+            rec=self._load(FIRST_FILE)
+            if set(rec)!={"observation","first_lease"}:
+                raise ValueError("Incomplete first signed observation/lease")
+            lease=rec["first_lease"]["evidence"]
+            if lease["guard_observation_sha256"]!=store.sha(store.json_bytes(rec["observation"]["evidence"])):
+                raise ValueError("First lease not bound to its independent observation")
+        else:
+            rec=self._load(f"warm-transition-{index+1:02d}.json")
+            if set(rec)!={"readback","next_lease","committed"}:
+                raise ValueError("Incomplete committed warm transition")
+            lease=rec["next_lease"]["evidence"]
+            rsha=store.sha(store.json_bytes(rec["readback"]["evidence"]))
+            if rsha!=tips[-2]["receipt_sha"] or rsha!=lease["prior_readback_sha256"]:
+                raise ValueError("Transition does not preserve the prior independent receipt")
+        if (lease["index"]!=index or lease["scenario_id"]!=self._scope.case_ids[index]
+                or lease["scope_sha256"]!=self._scope.digest or lease["run_id"]!=tips[-1]["run_id"]
+                or store.sha(store.json_bytes(lease))!=tips[-1]["lease_sha"]
+                or self._now()>=lease["case_deadline"]):
+            raise ValueError("Exact active lease does not match the official journal or cutoff")
+        return lease,tips
+
+    def seal_full_case(self, *, archive, transfer_trust):
+        e,_=self._active_full()
+        self._transfer_trust(transfer_trust,e,e["guard_observation_sha256"])
+        digest=transfer.inspect_full_archive(archive,transfer_trust.release)
+        self.journal.seal_active(e["run_id"],**digest)
+        seal={"run_id":e["run_id"],"scenario_id":e["scenario_id"],"index":e["index"],
+              "scope_sha256":self._scope.digest,**digest}
+        self._write(f"controller-case-{e['index']+1:02d}-seal.json",seal)
+        return seal
+
+    def halt_full_case(self, *, run_id, reason):
+        """Trusted controller only; no provider calls or automatic STOP."""
+        if self._scope.mode!=warm.OFFICIAL:
+            raise ValueError("No independently approved full mode")
+        return self.journal.halt(run_id,reason)
+
+    def accept_full_case(self, *, transfer_trust, get_envelope, get_url, cf_read_token,
+                         pod_read_token, next_run_id=None):
+        """One case: sealed independent GET, then one contiguous lease or full proof."""
+        e,tips=self._active_full()
+        index=e["index"]
+        final=index+1==self._scope.case_limit
+        if (final and next_run_id is not None or not final and (
+            not warm._uuid(next_run_id) or next_run_id==self._scope.allocation.batch_id or
+            any(row["run_id"]==next_run_id for row in tips))):
+            raise ValueError("Expected one distinct next UUID, and no UUID after the final case")
+        self._transfer_trust(transfer_trust,e,e["guard_observation_sha256"])
+        seal=self._load(f"controller-case-{index+1:02d}-seal.json")
+        if (set(seal)!={"run_id","scenario_id","index","scope_sha256","sha256","size"}
+                or any(seal[k]!=e[k] for k in ("run_id","scenario_id","index","scope_sha256"))):
+            raise ValueError("Protected exact pre-upload seal is missing")
+        grant=get_envelope.get("evidence") if type(get_envelope) is dict else None
+        if (type(grant) is not dict or (grant.get("sha256"),grant.get("size"))!=(seal["sha256"],seal["size"])
+                or type(grant.get("deadline")) is not int or grant["deadline"]>e["case_deadline"]):
+            raise ValueError("GET grant does not match protected case seal")
+        try:
+            proof=transfer.verify_full_case_at_controller(trust=transfer_trust,get_envelope=get_envelope,
+                                                           get_url=get_url,receipt_dir=self.state_dir)
+        except ReadbackMismatch:
+            self.journal.halt(e["run_id"],"corrupt_readback")
+            raise
+        if (proof["schema"]!=transfer.FULL_READBACK or proof["scenario_id"]!=e["scenario_id"]
+                or (proof["run_id"],proof["sha256"],proof["bytes"])!=(e["run_id"],seal["sha256"],seal["size"])):
+            raise ValueError("Readback is not the exact independently sealed case")
+        done=self._now()
+        next_tick=math.ceil(done)
+        if next_tick>=e["case_deadline"]:
+            raise ValueError("No time to commit exact receipt")
+        if next_tick>done:
+            time.sleep(next_tick-done)
+        stamp=int(self._now())
+        r={"schema":warm.GET,"scope_sha256":self._scope.digest,"index":index,"scenario_id":e["scenario_id"],
+           "run_id":e["run_id"],"observed_at":stamp,"expires_at":min(stamp+60,e["case_deadline"]),
+           "method":"GET","bucket":"tcc","key":proof["key"],"sha256":proof["sha256"],"size":proof["bytes"],
+           "verified_own_generations":1000,"verified_ledgers":20,"rounds":50,"nodes":20,
+           "archive_verified":True,"independent_get":True}
+        readback=self._sign(r,warm.GET)
+        receipt_sha=store.sha(store.json_bytes(r))
+        guard=self._observe(cf_read_token,pod_read_token)
+        guard_e=guard["evidence"]
+        if guard_e["observed_at"]<stamp:
+            raise ValueError("Fresh guard observation precedes independent GET")
+        guard_sha=store.sha(store.json_bytes(guard_e))
+        self._write("controller-fresh-guard-"+guard_sha+".json",guard)
+        if final:
+            if self.journal.finalize_last(readback)!=receipt_sha:
+                raise ValueError("Exact terminal receipt not committed")
+            status=self.journal.status()
+            if (len(status)!=self._scope.case_limit or [s["idx"] for s in status]!=list(range(self._scope.case_limit))
+                    or status[-1]["receipt_sha"]!=receipt_sha
+                    or any(not warm._hex(s["receipt_sha"],64) for s in status)):
+                raise ValueError("No exact ordered complete receipt set")
+            items=[{"index":s["idx"],"scenario_id":self._scope.case_ids[s["idx"]],"run_id":s["run_id"],
+                    "receipt_sha256":s["receipt_sha"]} for s in status]
+            f={"schema":FULL_VERIFIED,"scope_sha256":self._scope.digest,"batch_id":self._scope.allocation.batch_id,
+               "resource_id":self._scope.allocation.resource_id,"git_sha":self._scope.allocation.git_sha,
+               "profile_sha256":self._scope.allocation.profile_sha256,"verified_cases":len(items),
+               "receipt_set_sha256":store.sha(store.json_bytes(items)),"next_case_authorized":False,
+               "stop_authorized":False,"guard_observation_sha256":guard_sha,"committed_at":int(self._now())}
+            result={"readback":readback,"receipt_set":items,"verified":self._sign(f,warm.LEASE)}
+            self._write(FULL_FINAL_FILE,result)
+            return result
+        le=self._lease(index+1,next_run_id,guard,receipt_sha)
+        lease=self._sign(le,warm.LEASE)
+        digest=self.journal.transition(readback,lease)
+        status=self.journal.status()
+        if (len(status)!=index+2 or status[-2]["receipt_sha"]!=receipt_sha or status[-1]!={
+                "idx":index+1,"run_id":next_run_id,"lease_sha":digest,"receipt_sha":None}):
+            raise ValueError("Contiguous lease was not durably committed")
+        committed=int(self._now())
+        expires=min(r["expires_at"],le["expires_at"])
+        if not le["observed_at"]<=committed<expires-1:
+            raise ValueError("Transition committed too late to relay; do not replay the worker")
+        mark={"schema":COMMITTED,"scope_sha256":self._scope.digest,"receipt_sha256":receipt_sha,
+              "lease_sha256":digest,"index":index+1,"run_id":next_run_id,"committed_at":committed,"expires_at":expires}
+        relay={"readback":readback,"next_lease":lease,"committed":self._sign(mark,warm.LEASE)}
+        if self._now()>=expires:
+            raise ValueError("Committed relay expired before publication; do not replay the worker")
+        self._write(f"warm-transition-{index+2:02d}.json",relay)
+        return relay

@@ -38,6 +38,15 @@ SPKI_ED25519 = bytes.fromhex("302a300506032b6570032100")
 MAX_RESPONSE = 128 * 1024
 
 
+def _terminal_key(raw):
+    if raw is None:
+        return True
+    if type(raw) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}",raw) is None:
+        return False
+    decoded=base64.urlsafe_b64decode(raw+"=")
+    return len(decoded)==32 and base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")==raw
+
+
 def _approved(raw, wanted):
     if (type(raw) is not bytes or not 0 < len(raw) <= 16384 or not live._hex(wanted, 64)
             or not hmac.compare_digest(store.sha(raw), wanted)):
@@ -50,7 +59,8 @@ def _approved(raw, wanted):
     if (plan["schema"] != PLAN_SCHEMA or type(t) is not dict or set(t) != live.trust_fields(t)
             or not live._guid(plan["worker_deployment_id"])
             or not live._hex(plan["observer_spki_sha256"],64)
-            or plan["terminal_pub_key"] is not None
+            or not _terminal_key(plan["terminal_pub_key"])
+            or (t.get("qualification_mode")==SHORT_MODE and plan["terminal_pub_key"] is not None)
             or not live._hex(t["cloudflare_account_id"],32) or not live._hex(t["batch_id"],32)
             or not live._hex(plan["run_id"],32) or not live._hex(t["git_sha"],40)
             or not all(live._guid(t[k]) for k in ("workflow_id","workflow_version","worker_version"))
@@ -132,11 +142,11 @@ def _start_epoch(value):
     return int(datetime.fromisoformat(value[:-1]+"+00:00").timestamp())
 
 
-def _payload(t, instance):
+def _payload(t, instance, terminal_pub_key=None):
     return {"batch":instance,"pod":t["resource_id"],"owner":t["owner_id"],
             "datacenter":t["datacenter_id"],"name":t["pod_name"],"startedAt":live._iso(t["opened_at"]),
             "stopAt":live._iso(t["stop_at"]),"deadline":live._iso(t["hard_deadline"]),
-            "gitSha":t["git_sha"],"profileSha256":t["profile_sha256"],"terminalPubKey":None,
+            "gitSha":t["git_sha"],"profileSha256":t["profile_sha256"],"terminalPubKey":terminal_pub_key,
             **({"qualificationMode":SHORT_MODE} if t.get("qualification_mode")==SHORT_MODE else {})}
 
 
@@ -167,7 +177,7 @@ def _collect(plan, cf_token, pod_token):
                (plan["worker_deployment_id"],"percentage",[{"version_id":t["worker_version"],"percentage":100}])):
         raise ValueError("Cloudflare rollout and Workflow release do not match the exact pins")
     arm=_step(cf(instance_path+"/step?"+urlencode({"name":ARM,"type":"step"})))
-    payload=_payload(t,instance)
+    payload=_payload(t,instance,plan["terminal_pub_key"])
     bind={"batch":instance,"pod":t["resource_id"],"stopAt":payload["stopAt"],
           "deadline":payload["deadline"],"gitSha":t["git_sha"],"profileSha256":t["profile_sha256"],
           "workerVersion":t["worker_version"],**({"qualificationMode":SHORT_MODE} if short else {})}

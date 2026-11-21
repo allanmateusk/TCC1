@@ -207,3 +207,25 @@ class ObserverTests(unittest.TestCase):
                 return real([str(openssl),*original[1:]],**kwargs)
             with patch.object(live.subprocess,"run",side_effect=fixture_cli):
                 live._verify_signature(result["evidence"],base64.b64decode(result["signature_ed25519_base64"]),pem)
+
+    def test_official_pins_exact_terminal_key_and_short_rejects_it(self):
+        pin=base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+        self.plan["terminal_pub_key"]=pin
+        self.responses["instance"]["params"]["terminalPubKey"]=pin
+        raw=store.json_bytes(self.plan)
+        self.assertEqual(observer._approved(raw,store.sha(raw))["terminal_pub_key"],pin)
+        self.assertEqual(self.collect()["status"],"running")
+        self.responses["instance"]["params"]["terminalPubKey"]=None
+        with self.assertRaises(ValueError):
+            self.collect()
+        self.plan["terminal_pub_key"]=pin+"="
+        raw=store.json_bytes(self.plan)
+        with self.assertRaises(ValueError):
+            observer._approved(raw,store.sha(raw))
+        self.plan["terminal_pub_key"]=pin
+        self.plan["linux_trust"]["qualification_mode"]="qualification-60m-two-case"
+        self.plan["linux_trust"]["stop_at"]=self.t["opened_at"]+3300
+        self.plan["linux_trust"]["hard_deadline"]=self.t["opened_at"]+3600
+        raw=store.json_bytes(self.plan)
+        with self.assertRaises(ValueError):
+            observer._approved(raw,store.sha(raw))

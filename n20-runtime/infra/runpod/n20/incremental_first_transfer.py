@@ -1,4 +1,4 @@
-"""Exact first-case R2 handoff. No CLI, signer, next-case grant, or provider calls.
+"""Exact case-bound R2 handoff. No CLI, signer, next-case grant, or provider calls.
 
 A trusted installer must supply local immutable pins and a separate authenticated
 observer/signer must attest the active release after the archive has sealed.
@@ -29,6 +29,8 @@ AUDITS = [10, 20, 30, 40, 50]
 SECOND_CASE = IDS[1]
 SECOND_SCHEMA = "tcc-incremental-second-case-publication/v1"
 SECOND_READBACK = "tcc-incremental-second-case-independent-readback/v1"
+FULL_SCHEMA = "tcc-incremental-full-case-publication/v1"
+FULL_READBACK = "tcc-incremental-full-case-independent-readback/v1"
 
 
 def _hex(value, length):
@@ -65,6 +67,24 @@ class PinnedRelease:
 
 
 @dataclass(frozen=True)
+class FullCaseRelease(PinnedRelease):
+    scope_sha256: str
+    case_index: int
+    case_deadline: int
+
+    def __post_init__(self):
+        super().__post_init__()
+        if (not _hex(self.scope_sha256,64) or type(self.case_index) is not int
+                or not 0<=self.case_index<len(IDS) or type(self.case_deadline) is not int
+                or not 0<self.case_deadline<=self.stop_at):
+            raise ValueError("Expected exact case and lease in an explicitly pinned full campaign")
+
+    @property
+    def case(self):
+        return IDS[self.case_index]
+
+
+@dataclass(frozen=True)
 class TransferTrust:
     release: PinnedRelease
     authority_pem: bytes
@@ -73,7 +93,7 @@ class TransferTrust:
     openssl: Path
 
     def __post_init__(self):
-        if (type(self.release) is not PinnedRelease or type(self.authority_pem) is not bytes
+        if (type(self.release) not in (PinnedRelease,FullCaseRelease) or type(self.authority_pem) is not bytes
                 or not 0<len(self.authority_pem)<=256
                 or not re.fullmatch(rb"-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n", self.authority_pem)
                 or not _hex(self.authority_pem_sha256,64)
@@ -110,8 +130,8 @@ def _verified_signature(trust, evidence, signature):
             raise ValueError("Publication proof signature not verified")
 
 
-def _authorize_envelope(trust, envelope, url, method, *, now, case=CASE):
-    schema = {CASE:SCHEMA, SECOND_CASE:SECOND_SCHEMA}[case]
+def _authorize_envelope(trust, envelope, url, method, *, now, case=CASE, full=False):
+    schema = FULL_SCHEMA if full else {CASE:SCHEMA, SECOND_CASE:SECOND_SCHEMA}[case]
     if (type(trust) is not TransferTrust or type(envelope) is not dict
             or set(envelope) != {"evidence","signature_ed25519_base64"}
             or type(url) is not str or not 0<len(url)<4096):
@@ -120,6 +140,10 @@ def _authorize_envelope(trust, envelope, url, method, *, now, case=CASE):
     fields = {"schema","release","method","scenario_id","campaign_id","bucket","key","sha256","size",
               "deadline","observed_at","guard_phase","sleep_name","sleep_end","url_sha256"}
     p = trust.release
+    if (full and (type(p) is not FullCaseRelease or case!=p.case)
+            or not full and type(p) is not PinnedRelease):
+        raise ValueError("Cannot cross the full and two-case transfer scopes")
+    deadline = p.case_deadline if full else p.stop_at
     if (type(ev) is not dict or set(ev)!=fields or ev["schema"]!=schema
             or type(ev["release"]) is not dict or ev["release"]!=asdict(p)
             or ev["method"]!=method or ev["scenario_id"]!=case
@@ -129,7 +153,7 @@ def _authorize_envelope(trust, envelope, url, method, *, now, case=CASE):
             or ev["url_sha256"]!=store.sha(url.encode("ascii"))
             or type(ev["observed_at"]) is not int or type(ev["deadline"]) is not int
             or not ev["observed_at"]<=now<=ev["observed_at"]+60
-            or not now<ev["deadline"]<=min(p.stop_at,ev["observed_at"]+300)):
+            or not now<ev["deadline"]<=min(deadline,ev["observed_at"]+300)):
         raise ValueError("Publication proof does not match the fresh exact guard, role or grant")
     _verified_signature(trust, ev, envelope["signature_ed25519_base64"])
     scope = tx.Scope(p.run_id,case,cp.INCREMENTAL_SCHEMA,p.profile_sha256,"tcc",ev["key"],
@@ -146,14 +170,16 @@ def _authorize_envelope(trust, envelope, url, method, *, now, case=CASE):
 
 
 def _inspect_archive(data, release, case):
-    if type(release) is not PinnedRelease or type(data) is not bytes or case not in (CASE,SECOND_CASE):
-        raise ValueError("Exact two-case release and immutable ZIP bytes required")
+    if (type(data) is not bytes or type(release) not in (PinnedRelease,FullCaseRelease)
+            or type(release) is PinnedRelease and case not in (CASE,SECOND_CASE)
+            or type(release) is FullCaseRelease and case!=release.case):
+        raise ValueError("Exact scoped case and immutable ZIP bytes required")
     facts = store.verify_archive(data, release.run_id)
     expected = {"scenario_id":case,"campaign_id":cp.INCREMENTAL_SCHEMA,
                 "profile_sha256":release.profile_sha256,"run_kind":"official","nodes":20,"rounds":50,
                 "verified_own_generations":1000,"verified_ledgers":20,"verified_audit_rounds":AUDITS,
                 "verified_genesis_rounds":[],"verified_intentional_absences":0}
-    if case==SECOND_CASE:
+    if case!=CASE:
         profile = cp.resolve("incremental-v1")
         row = next(r for r in profile["scenarios"] if r["id"]==case)
         plan = cp.plan(profile,row,0,50)
@@ -179,6 +205,13 @@ def inspect_second_archive(data, release):
     return _inspect_archive(data,release,SECOND_CASE)
 
 
+def inspect_full_archive(data, release):
+    """Full official seal validation: exact case ID from immutable lease."""
+    if type(release) is not FullCaseRelease:
+        raise ValueError("No explicitly pinned official-full release")
+    return _inspect_archive(data,release,release.case)
+
+
 def _authorization(scope, method):
     # Capability is generated only by the signed-envelope boundary above.
     return lambda got, verb: got is scope and verb==method and time.time()<scope.deadline
@@ -191,9 +224,9 @@ def _protected_directory(directory):
     return p
 
 
-def _publish(*, trust, put_envelope, put_url, archive, journal_dir, case):
+def _publish(*, trust, put_envelope, put_url, archive, journal_dir, case, full=False):
     now=time.time()
-    scope,cfg,stamp=_authorize_envelope(trust,put_envelope,put_url,"PUT",now=now,case=case)
+    scope,cfg,stamp=_authorize_envelope(trust,put_envelope,put_url,"PUT",now=now,case=case,full=full)
     sealed=_inspect_archive(archive,trust.release,case)
     if sealed!={"sha256":scope.sha256,"size":scope.size}:
         raise ValueError("ZIP does not match the signed independent seal")
@@ -213,9 +246,9 @@ def publish_second_from_pod(*, trust, put_envelope, put_url, archive, journal_di
                     journal_dir=journal_dir,case=SECOND_CASE)
 
 
-def _verify(*, trust, get_envelope, get_url, receipt_dir, case):
+def _verify(*, trust, get_envelope, get_url, receipt_dir, case, full=False):
     now=time.time()
-    scope,cfg,stamp=_authorize_envelope(trust,get_envelope,get_url,"GET",now=now,case=case)
+    scope,cfg,stamp=_authorize_envelope(trust,get_envelope,get_url,"GET",now=now,case=case,full=full)
     directory=_protected_directory(receipt_dir)
     receipt=tx.verify_get(scope,cfg,get_url,authorize=_authorization(scope,"GET"),
                           opener=tx.tls_opener(),now=stamp)
@@ -226,7 +259,7 @@ def _verify(*, trust, get_envelope, get_url, receipt_dir, case):
         raise ValueError("Invalid independent readback result")
     # The signer verified the case and Git on the pre-upload seal. Readback revalidates
     # archive semantics and proves it is byte-for-byte that same protected seal.
-    schema,suffix = (READBACK,"first") if case==CASE else (SECOND_READBACK,"second")
+    schema,suffix = (FULL_READBACK,"full") if full else ((READBACK,"first") if case==CASE else (SECOND_READBACK,"second"))
     result={**receipt,"schema":schema,"release":asdict(trust.release),
             "eligible_for_next_case":False,"eligible_for_batch_completion":False}
     store.write_atomic(directory/(scope.run_id+f".{suffix}-case-readback.json"),store.json_bytes(result))
@@ -241,3 +274,19 @@ def verify_at_controller(*, trust, get_envelope, get_url, receipt_dir):
 def verify_second_at_controller(*, trust, get_envelope, get_url, receipt_dir):
     """Case two readback; neither this proof nor the launcher grants a third case."""
     return _verify(trust=trust,get_envelope=get_envelope,get_url=get_url,receipt_dir=receipt_dir,case=SECOND_CASE)
+
+
+def publish_full_case_from_pod(*, trust, put_envelope, put_url, archive, journal_dir):
+    """One official-full Pod PUT scoped only to the currently signed case release."""
+    if type(trust) is not TransferTrust or type(trust.release) is not FullCaseRelease:
+        raise ValueError("No explicitly pinned official-full release")
+    return _publish(trust=trust,put_envelope=put_envelope,put_url=put_url,archive=archive,
+                    journal_dir=journal_dir,case=trust.release.case,full=True)
+
+
+def verify_full_case_at_controller(*, trust, get_envelope, get_url, receipt_dir):
+    """Independent official-full GET; its raw receipt grants no execution or STOP."""
+    if type(trust) is not TransferTrust or type(trust.release) is not FullCaseRelease:
+        raise ValueError("No explicitly pinned official-full release")
+    return _verify(trust=trust,get_envelope=get_envelope,get_url=get_url,receipt_dir=receipt_dir,
+                   case=trust.release.case,full=True)

@@ -15,13 +15,18 @@ import re
 import ssl
 import time
 from urllib.request import build_opener, HTTPSHandler, ProxyHandler, Request
+from zipfile import BadZipFile
 
 from . import artifact_store as store, campaign_profiles as cp, r2_grants
-from .r2_verified_pilot import _request, TransferError, Transient, ExistingObject
+from .r2_verified_pilot import _request, DownloadSizeMismatch, TransferError, Transient, ExistingObject
 
 KEY = re.compile(r"tcc/prod/incremental-v1/n20-[a-f0-9]{32}\.zip\Z")
 RUN_ID = re.compile(r"[a-f0-9]{32}\Z")
 RECEIPT = "tcc-n20-incremental-r2-readback/v1"
+
+
+class ReadbackMismatch(TransferError):
+    """Definitive received content mismatch, not a transient absence."""
 
 
 @dataclass(frozen=True)
@@ -120,7 +125,10 @@ def verify_get(scope, config, get_url, *, authorize, opener, now=None):
     """Use only the reader grant and independently assigned digest, not the Pod ACK."""
     transport_deadline = _preflight(scope,config,get_url,"GET",authorize,now=now)
     data=_wire_get(get_url,scope.size,opener=opener,deadline=transport_deadline)
-    scope.valid_bytes(data)
+    try:
+        scope.valid_bytes(data)
+    except (ValueError,BadZipFile,KeyError):
+        raise ReadbackMismatch("Independent GET content does not match the protected archive") from None
     return {"schema":RECEIPT,"status":"verified",**scope.proof_fields(),
             "nodes":20,"rounds":50,"verified_own_generations":1000}
 
@@ -135,4 +143,6 @@ def _wire_get(get_url,size,*,opener,deadline):
             return _request(opener,request,deadline,time.monotonic,size=size)
         except Transient:
             continue
+        except DownloadSizeMismatch:
+            raise ReadbackMismatch("Independent GET exceeded the protected archive size") from None
     raise TransferError("Independent R2 download not verified")

@@ -38,6 +38,10 @@ class ExistingObject(TransferError):
     pass
 
 
+class DownloadSizeMismatch(TransferError):
+    """Authenticated response exceeded its independently sealed byte budget."""
+
+
 def object_key(run_id, kind="pilot"):
     if not store.RUN_ID.fullmatch(run_id or "") or kind not in transport.PREFIXES:
         raise ValueError("Malformed run ID or phase")
@@ -94,7 +98,7 @@ def _request(open_url, request, deadline, clock, *, size):
                     return bytes(data)
                 data.extend(chunk)
                 if len(data)>size:
-                    raise TransferError("Unexpected R2 download size")
+                    raise DownloadSizeMismatch("Unexpected R2 download size")
     except HTTPError as err:
         code = err.code
         if method=="PUT" and code in (409,412):

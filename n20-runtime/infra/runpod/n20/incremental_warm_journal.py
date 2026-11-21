@@ -23,6 +23,8 @@ from .incremental_campaign import IDS, SCHEMA as CAMPAIGN
 
 LEASE="tcc-warm-controller-case-lease/v1"
 GET="tcc-warm-external-r2-readback/v1"
+QUALIFICATION="qualification-two"
+OFFICIAL="official-full"
 BASE={"schema","scope_sha256","index","scenario_id","run_id","observed_at","expires_at"}
 LEASE_FIELDS=BASE | {"guard_observation_sha256","case_deadline","prior_readback_sha256"}
 GET_FIELDS=BASE | {"method","bucket","key","sha256","size","verified_own_generations",
@@ -45,9 +47,14 @@ class Scope:
     worker_version_id: str
     lease_key_sha256: str
     readback_key_sha256: str
+    mode: str = QUALIFICATION
 
     def __post_init__(self):
-        if (type(self.allocation) not in (BatchProtection,QualificationProtection) or not _uuid(self.allocation.batch_id)
+        if (self.mode not in (QUALIFICATION,OFFICIAL)
+            or self.mode==OFFICIAL and (
+                type(self.allocation) is not BatchProtection
+                or self.allocation.hard_deadline-self.allocation.stop_at!=300)
+            or type(self.allocation) not in (BatchProtection,QualificationProtection) or not _uuid(self.allocation.batch_id)
             or self.guard_instance_id!=str(uuid.UUID(hex=self.allocation.batch_id))
             or not all(type(x) is str and str(uuid.UUID(x))==x for x in (self.guard_version_id,self.worker_version_id))
             or not all(_hex(x,64) for x in (self.lease_key_sha256,self.readback_key_sha256))
@@ -56,12 +63,22 @@ class Scope:
 
     @property
     def case_ids(self):
-        return IDS[:2] if type(self.allocation) is QualificationProtection else IDS
+        return IDS if self.mode==OFFICIAL else IDS[:2]
+
+    @property
+    def case_limit(self):
+        return len(self.case_ids)
 
     @property
     def digest(self):
+        fields=asdict(self)
+        if self.mode==QUALIFICATION:
+            fields.pop("mode")  # keep archived short/qualification pins readable
+            ordered=IDS[:2] if type(self.allocation) is QualificationProtection else IDS
+        else:
+            ordered=self.case_ids
         return sha(json_bytes({"schema":"tcc-warm-controller-scope/v1","campaign":CAMPAIGN,
-                               "scenarios":self.case_ids,**asdict(self)}))
+                               "scenarios":ordered,**fields}))
 
 
 def _key_der(pem):
@@ -178,6 +195,8 @@ class Journal:
             db.execute("BEGIN IMMEDIATE")
             if initialize:
                 db.execute("CREATE TABLE IF NOT EXISTS plan (one INTEGER PRIMARY KEY CHECK(one=1), digest TEXT NOT NULL)")
+                db.execute("""CREATE TABLE IF NOT EXISTS halt (one INTEGER PRIMARY KEY CHECK(one=1),
+                           run_id TEXT NOT NULL, reason TEXT NOT NULL)""")
                 db.execute("""CREATE TABLE IF NOT EXISTS cases (idx INTEGER PRIMARY KEY, run_id TEXT UNIQUE NOT NULL,
                      lease_sha TEXT NOT NULL, admitted REAL NOT NULL, cutoff INTEGER NOT NULL,
                      seal_sha TEXT, seal_size INTEGER, sealed REAL, receipt_sha TEXT)""")
@@ -212,9 +231,31 @@ class Journal:
         db.execute("INSERT INTO cases(idx,run_id,lease_sha,admitted,cutoff) VALUES (?,?,?,?,?)",
                    (g["index"],g["run_id"],digest,now,g["case_deadline"]))
 
+    @staticmethod
+    def _require_open(db):
+        if db.execute("SELECT 1 FROM halt WHERE one=1").fetchone() is not None:
+            raise ValueError("Protected batch halted; do not advance or relaunch")
+
+    def failure(self):
+        with self._txn() as db:
+            row=db.execute("SELECT run_id,reason FROM halt WHERE one=1").fetchone()
+            return dict(row) if row else None
+
+    def halt(self,run_id,reason):
+        if not _uuid(run_id) or reason not in ("cancelled","case_failed","corrupt_readback","invalid_archive"):
+            raise ValueError("Expected an exact failed run and known terminal category")
+        with self._txn() as db:
+            row=self._tip(db)
+            if row is None or row["run_id"]!=run_id or row["receipt_sha"] is not None:
+                raise ValueError("Cannot halt a different or already completed active attempt")
+            db.execute("INSERT OR IGNORE INTO halt VALUES(1,?,?)",(run_id,reason))
+            latched=db.execute("SELECT run_id,reason FROM halt WHERE one=1").fetchone()
+            return dict(latched)
+
     def first(self,lease):
         g,digest=self.authorities.validate(lease,LEASE,self._now())
         with self._txn() as db:
+            self._require_open(db)
             now=self._still_fresh([g])
             if g["index"]!=0 or self._tip(db) is not None:
                 raise ValueError("The sole initial lease has already been used or is not first")
@@ -227,6 +268,7 @@ class Journal:
         if not _uuid(run_id) or not _hex(sha256,64) or type(size) is not int or not 0<size<=MAX_ZIP:
             raise ValueError("Unrecognized local seal")
         with self._txn() as db:
+            self._require_open(db)
             row=self._tip(db)
             now=self._now()
             if (row is None or row["run_id"]!=run_id or row["receipt_sha"] is not None or
@@ -244,6 +286,7 @@ class Journal:
         r,receipt_sha=self.authorities.validate(readback,GET,now)
         g,lease_sha=self.authorities.validate(next_lease,LEASE,now)
         with self._txn() as db:
+            self._require_open(db)
             now=self._still_fresh([r,g])
             row=self._tip(db)
             if (row is None or row["receipt_sha"] is not None or
@@ -257,20 +300,29 @@ class Journal:
         return lease_sha
 
     def finalize_second(self,readback):
-        """Durably record exact case two GET, never issue any further lease."""
+        """Separate legacy qualification: cannot finish or advance official scope."""
+        if self.authorities.scope.mode!=QUALIFICATION:
+            raise ValueError("Use the explicitly approved official batch finalizer")
+        return self.finalize_last(readback)
+
+    def finalize_last(self,readback):
+        """Commit an exact signed GET only after every preceding case was committed."""
+        count=self.authorities.scope.case_limit
         r,receipt_sha=self.authorities.validate(readback,GET,self._now())
         with self._txn() as db:
+            self._require_open(db)
             now=self._still_fresh([r])
             rows=db.execute("SELECT * FROM cases ORDER BY idx").fetchall()
-            if len(rows)!=2 or rows[0]["idx"]!=0 or rows[0]["receipt_sha"] is None:
-                raise ValueError("There is no independently verified first-to-second transition")
-            row=rows[1]
-            if (r["index"]!=1 or row["receipt_sha"] is not None or row["sealed"] is None
+            if len(rows)!=count or [row["idx"] for row in rows]!=list(range(count)) or any(
+                not _hex(row["receipt_sha"],64) for row in rows[:-1]):
+                raise ValueError("There is no exact prior ordered independently verified receipt set")
+            row=rows[-1]
+            if (r["index"]!=count-1 or row["receipt_sha"] is not None or row["sealed"] is None
                     or (r["index"],r["run_id"],r["sha256"],r["size"]) !=
                        (row["idx"],row["run_id"],row["seal_sha"],row["seal_size"])
                     or not row["sealed"]<=r["observed_at"]<=now<row["cutoff"]):
-                raise ValueError("Second case is not ready for an exact live GET receipt")
-            db.execute("UPDATE cases SET receipt_sha=? WHERE idx=1",(receipt_sha,))
+                raise ValueError("Last case is not ready for an exact live GET receipt")
+            db.execute("UPDATE cases SET receipt_sha=? WHERE idx=?",(receipt_sha,r["index"]))
         return receipt_sha
 
     def status(self):
