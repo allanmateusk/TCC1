@@ -1,0 +1,76 @@
+{
+  "schema": "tcc-live-n20/v1",
+  "nodes": 20,
+  "rounds": 50,
+  "gpu_count": 2,
+  "gpu_target": "Linux CUDA; capacity pending SmolLM3-3B measurement",
+  "models_per_gpu": 10,
+  "inference_layout": "per_node",
+  "model": "HuggingFaceTB/SmolLM3-3B",
+  "model_revision": "a07cc9a04f16550a088caea529712d1d335b0ac1",
+  "quantization": "nf4",
+  "max_new_tokens": 256,
+  "temperature": 0.7,
+  "top_p": 0.95,
+  "task_file": "sistema/dados/gsm8k_test_n20.json",
+  "task_sha256": "c796cb3ddade421869397dde2dd1a6375daa17c95cdd6f7b744c8cf244f8384d",
+  "timeout_minutes": 110,
+  "protocol": {
+    "degree": 4,
+    "topology": "kregular",
+    "signal": "consensus",
+    "consensus_mode": "distance",
+    "consensus_center": "medoid",
+    "mechanism": "ema_slow_up",
+    "defense": "all",
+    "audit_mode": "random",
+    "audit_p": 0.2,
+    "score": "exact",
+    "honest_rounds": 5,
+    "malicious_strategy": "knows_schedule",
+    "collusion_value": 999,
+    "relative_noise_distance": 0.2
+  },
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "scenarios": [
+    {
+      "id": "baseline",
+      "malicious_nodes": 0,
+      "noise_mode": "relative"
+    },
+    {
+      "id": "m20-alto",
+      "malicious_nodes": 4,
+      "noise_mode": "multiplicative"
+    },
+    {
+      "id": "m40-alto",
+      "malicious_nodes": 8,
+      "noise_mode": "multiplicative"
+    },
+    {
+      "id": "m80-alto",
+      "malicious_nodes": 16,
+      "noise_mode": "multiplicative"
+    },
+    {
+      "id": "m40-sutil",
+      "malicious_nodes": 8,
+      "noise_mode": "relative"
+    },
+    {
+      "id": "m80-sutil",
+      "malicious_nodes": 16,
+      "noise_mode": "relative"
+    }
+  ],
+  "model_type": "smollm3",
+  "thinking": false,
+  "vram_headroom": 1.2
+}
