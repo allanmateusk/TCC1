@@ -1,0 +1,36 @@
+{
+  "name": "tcc-runpod-batch-guard-candidate",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-11-21",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "workflows": [
+    {
+      "name": "tcc-runpod-batch-cutoff-candidate",
+      "binding": "BATCH_CUTOFF",
+      "class_name": "RunPodBatchCutoff"
+    },
+    {
+      "name": "tcc-runpod-batch-terminal-candidate",
+      "binding": "BATCH_TERMINAL",
+      "class_name": "RunPodBatchTerminal"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BATCH_STOP_BARRIER",
+        "class_name": "BatchStopBarrier"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "BatchStopBarrier"
+      ]
+    }
+  ]
+}
