@@ -7,7 +7,7 @@ import time
 
 from . import artifact_store as store, benchmark, campaign_profiles as cp, incremental_first_live as first
 from . import local_recovery, r2_verified_pilot
-from .incremental_batch_protection import BatchProtection
+from .incremental_batch_protection import protection_for
 from .incremental_campaign import IDS
 from .incremental_warm_journal import Authorities, GET, LEASE, Scope
 from sistema.scripts.resident_pool import ResidentPool
@@ -70,15 +70,16 @@ class WarmAdmission:
         raw=policy["scope"]
         if type(raw) is not dict or set(raw)!={f.name for f in fields(Scope)}:
             raise ValueError("Unexpected protected warm scope")
-        scope=Scope(**{**raw,"allocation":BatchProtection(**raw["allocation"])})
+        scope=Scope(**{**raw,"allocation":protection_for(raw["allocation"])})
         p=scope.allocation
         if policy["approved_scope_sha256"]!=scope.digest or (
             p.batch_id,p.resource_id,p.owner_id,p.datacenter_id,p.pod_name,p.git_sha,p.profile_sha256,
-            p.opened_at,p.stop_at,p.hard_deadline,scope.guard_instance_id,scope.guard_version_id,scope.worker_version_id
+            p.opened_at,p.stop_at,p.hard_deadline,getattr(p,"qualification_mode",None),
+            scope.guard_instance_id,scope.guard_version_id,scope.worker_version_id
         ) != (
             observation["batch_id"],observation["resource_id"],observation["owner_id"],observation["datacenter_id"],
             observation["pod_name"],observation["git_sha"],observation["profile_sha256"],observation["opened_at"],
-            observation["stop_at"],observation["hard_deadline"],observation["workflow_instance_id"],
+            observation["stop_at"],observation["hard_deadline"],observation.get("qualification_mode"),observation["workflow_instance_id"],
             observation["workflow_version"],observation["worker_version"]
         ):
             raise ValueError("Qualified warm release and initial signed guard do not match")

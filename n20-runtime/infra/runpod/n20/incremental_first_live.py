@@ -15,6 +15,7 @@ import tempfile
 import time
 import uuid
 
+from .incremental_batch_protection import SHORT_MODE, short_window
 from . import artifact_store, benchmark, campaign_profiles, local_recovery, r2_verified_pilot
 
 CASE="e4-c0-m00-p10-exact-u00-s0"
@@ -27,6 +28,16 @@ SIGNED=set(TRUST_KEYS)-{"durable_root","snapshot","service_uid"} | {
     "provider_phase","stop_enabled","sleep"}
 LOCAL_ENV={"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"}
 GIT="/usr/bin/git"
+
+
+def trust_fields(t):
+    if type(t) is not dict:
+        raise ValueError("Expected protected trust mapping")
+    if "qualification_mode" in t:
+        if t["qualification_mode"]!=SHORT_MODE:
+            raise ValueError("Unknown protected qualification mode")
+        return TRUST_KEYS|{"qualification_mode"}
+    return TRUST_KEYS
 
 
 def _hex(x,n):
@@ -58,10 +69,10 @@ def _iso(t):
 
 def verify_evidence(e,t,*,now,profile):
     # Caller must first authenticate signature with protected root-owned anchor.
-    if (type(e) is not dict or type(t) is not dict or set(t)!=TRUST_KEYS or set(e)!=SIGNED
+    if (type(e) is not dict or type(t) is not dict or set(t)!=trust_fields(t) or set(e)!=(SIGNED|(trust_fields(t)-TRUST_KEYS))
         or e["schema"]!="tcc-incremental-first-case-trusted-observation/v2" or e["scenario_id"]!=CASE):
         raise ValueError("No trusted first-case observation")
-    needed=set(TRUST_KEYS)-{"durable_root","snapshot","service_uid"}
+    needed=trust_fields(t)-{"durable_root","snapshot","service_uid"}
     if any(type(t[k]) is not type(e[k]) or e[k]!=t[k] for k in needed):
         raise ValueError("Mismatched provider, workflow or release binding")
     if (not _hex(e["git_sha"],40) or not _hex(e["profile_sha256"],64) or not _hex(e["cloudflare_account_id"],32)
@@ -83,8 +94,10 @@ def verify_evidence(e,t,*,now,profile):
                                           "observed_at","expires_at","peak_vram_mib")):
         raise ValueError("Observation timing and capacity must use exact integers")
     opened_ms=e["opened_at"]*1000
-    if (not (e["opened_at"]>0 and 4*3600<=e["hard_deadline"]-e["opened_at"]<=7*3600
-             and e["hard_deadline"]-e["stop_at"]==300)
+    opened,stop,end=(e[k] for k in ("opened_at","stop_at","hard_deadline"))
+    window=short_window(opened,stop,end) if t.get("qualification_mode")==SHORT_MODE else (
+        opened>0 and 4*3600<=end-opened<=7*3600 and end-stop==300)
+    if (not window
         or not (opened_ms<=e["armed_at_ms"]<=opened_ms+300_000
                 and e["armed_at_ms"]<=e["observed_at"]*1000)
         or not (e["observed_at"]<=now<e["expires_at"]<=e["observed_at"]+60)
@@ -134,7 +147,7 @@ def load_verified_handoff(profile):
     if sys.platform!="linux" or os.getuid()==0 or os.getuid()!=os.geteuid():
         raise ValueError("Protected Linux non-root service launcher required")
     trust=_load(_root_only(SERVICE/"first-case-trust.json",16384))
-    if type(trust) is not dict or set(trust)!=TRUST_KEYS or type(trust["service_uid"]) is not int or trust["service_uid"]!=os.getuid():
+    if type(trust) is not dict or set(trust)!=trust_fields(trust) or type(trust["service_uid"]) is not int or trust["service_uid"]!=os.getuid():
         raise ValueError("Untrusted first-case Linux service identity")
     envelope=_load(_root_only(SERVICE/"first-case-handoff.json",32768))
     if type(envelope) is not dict or set(envelope)!={"evidence","signature_ed25519_base64"}:
@@ -166,6 +179,8 @@ def _verify_release(git_sha):
 def run():
     profile,scenarios=benchmark.load_profile("incremental-v1")
     e,trust=load_verified_handoff(profile)
+    if "qualification_mode" in trust:
+        raise ValueError("Short qualification requires the protected two-case warm supervisor")
     _verify_release(e["git_sha"])
     scope=campaign_profiles.scope(profile)
     scenario=scenarios[CASE]

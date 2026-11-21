@@ -18,7 +18,7 @@ import time
 import uuid
 
 from .artifact_store import MAX_ZIP, json_bytes, sha
-from .incremental_batch_protection import BatchProtection
+from .incremental_batch_protection import BatchProtection, QualificationProtection
 from .incremental_campaign import IDS, SCHEMA as CAMPAIGN
 
 LEASE="tcc-warm-controller-case-lease/v1"
@@ -47,7 +47,7 @@ class Scope:
     readback_key_sha256: str
 
     def __post_init__(self):
-        if (type(self.allocation) is not BatchProtection or not _uuid(self.allocation.batch_id)
+        if (type(self.allocation) not in (BatchProtection,QualificationProtection) or not _uuid(self.allocation.batch_id)
             or self.guard_instance_id!=str(uuid.UUID(hex=self.allocation.batch_id))
             or not all(type(x) is str and str(uuid.UUID(x))==x for x in (self.guard_version_id,self.worker_version_id))
             or not all(_hex(x,64) for x in (self.lease_key_sha256,self.readback_key_sha256))
@@ -55,9 +55,13 @@ class Scope:
             raise ValueError("Expected immutable allocation/guard and separate authorities")
 
     @property
+    def case_ids(self):
+        return IDS[:2] if type(self.allocation) is QualificationProtection else IDS
+
+    @property
     def digest(self):
         return sha(json_bytes({"schema":"tcc-warm-controller-scope/v1","campaign":CAMPAIGN,
-                               "scenarios":IDS,**asdict(self)}))
+                               "scenarios":self.case_ids,**asdict(self)}))
 
 
 def _key_der(pem):
@@ -96,7 +100,7 @@ class Authorities:
         fields=LEASE_FIELDS if kind==LEASE else GET_FIELDS
         if type(ev) is not dict or set(ev)!=fields or ev["schema"]!=kind or ev["scope_sha256"]!=self.scope.digest:
             raise ValueError("No scoped grant (local/mock reports are not grants)")
-        if (type(ev["index"]) is not int or not 0<=ev["index"]<len(IDS) or ev["scenario_id"]!=IDS[ev["index"]]
+        if (type(ev["index"]) is not int or not 0<=ev["index"]<len(self.scope.case_ids) or ev["scenario_id"]!=self.scope.case_ids[ev["index"]]
             or not _uuid(ev["run_id"]) or ev["run_id"]==self.scope.allocation.batch_id
             or type(ev["observed_at"]) is not int or type(ev["expires_at"]) is not int
             or not self.scope.allocation.opened_at<=ev["observed_at"]<=now<ev["expires_at"]

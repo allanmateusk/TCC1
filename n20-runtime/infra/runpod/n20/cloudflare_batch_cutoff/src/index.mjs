@@ -1,5 +1,5 @@
 import { WorkflowEntrypoint, DurableObject } from "cloudflare:workers";
-import { armState, binding, claimState, pin, provider, runCutoffWorkflow, stopExact, verifyTerminal } from "./batch-guard.mjs";
+import { SHORT_MODE, armState, binding, claimState, pin, provider, runCutoffWorkflow, stopExact, verifyTerminal } from "./batch-guard.mjs";
 
 // Candidate is not armed and has no route. Do not fill from event data.
 const APPROVED=null;
@@ -13,11 +13,12 @@ function bounded(task) {
 
 export class BatchStopBarrier extends DurableObject {
   async arm(raw) {
-    const plan=pin(APPROVED,raw,raw?.batch);
+    const plan=pin(APPROVED,raw,raw?.batch,this.env.QUALIFICATION_MODE??null);
     return armState(this.ctx.storage,plan,Date.now);
   }
   async claim(raw,kind,proof,signature) {
-    const plan=pin(APPROVED,raw,raw?.batch);
+    const plan=pin(APPROVED,raw,raw?.batch,this.env.QUALIFICATION_MODE??null);
+    if (kind==="terminal" && plan.qualificationMode===SHORT_MODE) return false;
     if (kind==="terminal") await verifyTerminal(plan,proof,signature,Date.now());
     else if (kind!=="cutoff" || proof!==null || signature!==null) return false;
     return claimState(this.ctx.storage,plan,kind,Date.now());
@@ -33,7 +34,7 @@ function perform(env,raw,plan,kind,proof=null,signature=null) {
 export class RunPodBatchCutoff extends WorkflowEntrypoint {
   async run(event,step) {
     const raw=event.payload;
-    const plan=pin(APPROVED,raw,event.instanceId);
+    const plan=pin(APPROVED,raw,event.instanceId,this.env.QUALIFICATION_MODE??null);
     if (!this.env.RUNPOD_BATCH_STOP_TOKEN) throw Error("UNARMED_MISSING_SECRET");
     return runCutoffWorkflow(plan,step,{now:Date.now,workerVersion:this.env.CF_VERSION_METADATA?.id,
       arm:()=>bounded(binding(this.env.BATCH_STOP_BARRIER,plan).arm(raw)),
@@ -43,6 +44,8 @@ export class RunPodBatchCutoff extends WorkflowEntrypoint {
 
 export class RunPodBatchTerminal extends WorkflowEntrypoint {
   async run(event,step) {
+    if (APPROVED===null) throw Error("DISARMED_OR_WRONG_BATCH");
+    if (this.env.QUALIFICATION_MODE!==undefined) throw Error("NO_TERMINAL_IN_QUALIFICATION");
     const body=event.payload;
     if (!body || !["plan","proof","signature"].every(k=>Object.hasOwn(body,k)) || Object.keys(body).length!==3)
       throw Error("INVALID_TERMINAL_PAYLOAD");

@@ -8,12 +8,18 @@ import json
 import re
 
 from .batch_sequence import _hex
+from .incremental_campaign import IDS
 from .incremental_same_host import IncrementalPlan, IncrementalSameHost
 from .same_host_batch import HostPolicy, SameHostBatch
 from .watchdog import Resource
 
 SCHEMA = "tcc-n20-incremental-batch-protection-offline/v1"
 PHASES = {"active", "stopping", "stopped", "terminated"}
+SHORT_MODE = "qualification-60m-two-case"
+
+
+def short_window(opened, stop, deadline):
+    return opened > 0 and stop-opened==3300 and deadline-opened==3600
 
 
 @dataclass(frozen=True)
@@ -44,8 +50,7 @@ class BatchProtection:
                    self.fixed_and_other_microusd, self.approved_cap_microusd)
         if any(type(value) is not int or not 0 <= value <= 10**12 for value in numeric):
             raise ValueError("Use finite nonnegative integers for timestamps and micro-USD")
-        if not (self.opened_at > 0 and 4*3600 <= self.hard_deadline-self.opened_at <= 7*3600
-                and 60 <= self.hard_deadline-self.stop_at <= 600):
+        if not self.window_valid():
             raise ValueError("Absolute 4–7 h protection and 60–600 s reconciliation reserve required")
         if not (self.hourly_compute_microusd > 0 and self.approved_cap_microusd > 0
                 and self.cost_ceiling_microusd <= self.approved_cap_microusd):
@@ -54,6 +59,10 @@ class BatchProtection:
         self.host_policy()
         if 5 * self.host_policy().retry_seconds >= self.hard_deadline-self.stop_at:
             raise ValueError("Stop retry schedule requires enough reconciliation reserve")
+
+    def window_valid(self):
+        return (self.opened_at > 0 and 4*3600 <= self.hard_deadline-self.opened_at <= 7*3600
+                and 60 <= self.hard_deadline-self.stop_at <= 600)
 
     @property
     def cost_ceiling_microusd(self):
@@ -80,6 +89,36 @@ class BatchProtection:
 @dataclass(frozen=True)
 class _ProtectedQueuePlan(IncrementalPlan):
     protection_sha256: str
+
+
+@dataclass(frozen=True)
+class _QualificationQueuePlan(_ProtectedQueuePlan):
+    @property
+    def case_ids(self):
+        return IDS[:2]
+
+
+@dataclass(frozen=True)
+class QualificationProtection(BatchProtection):
+    """Separate signed 55-minute STOP / 60-minute hard deadline scope."""
+    qualification_mode: str = SHORT_MODE
+
+    def window_valid(self):
+        return self.qualification_mode==SHORT_MODE and short_window(self.opened_at,self.stop_at,self.hard_deadline)
+
+    def queue_plan(self):
+        return _QualificationQueuePlan(self.batch_id,self.git_sha,self.profile_sha256,"tcc",
+                  self.opened_at,self.stop_at,self.max_attempt_seconds,self.digest)
+
+
+def protection_for(value):
+    if type(value) is not dict:
+        raise ValueError("Expected exact protection mapping")
+    if "qualification_mode" in value:
+        if value["qualification_mode"]!=SHORT_MODE:
+            raise ValueError("Unknown qualification mode")
+        return QualificationProtection(**value)
+    return BatchProtection(**value)
 
 
 @dataclass(frozen=True)

@@ -22,11 +22,14 @@ from urllib.request import build_opener, HTTPSHandler, ProxyHandler, Request
 
 from . import artifact_store as store, campaign_profiles, incremental_first_live as live
 from .r2_grants import _NoRedirect
+from .incremental_batch_protection import SHORT_MODE, short_window
 
 CF_HOST = "api.cloudflare.com"
 RUNPOD_HOST = "api.runpod.io"
 CF_WORKER = "tcc-runpod-batch-guard-candidate"
 CF_WORKFLOW = "tcc-runpod-batch-cutoff-candidate"
+CF_SHORT_WORKER = "tcc-runpod-qualification-60m-guard-candidate"
+CF_SHORT_WORKFLOW = "tcc-runpod-qualification-60m-cutoff-candidate"
 CF_CLASS = "RunPodBatchCutoff"
 ARM = "bind-exact-batch-1"
 SLEEP = "absolute-batch-cutoff-1"
@@ -44,7 +47,7 @@ def _approved(raw, wanted):
                                              "observer_spki_sha256", "terminal_pub_key"}:
         raise ValueError("Wrong approved observer document shape")
     t = plan["linux_trust"]
-    if (plan["schema"] != PLAN_SCHEMA or type(t) is not dict or set(t) != live.TRUST_KEYS
+    if (plan["schema"] != PLAN_SCHEMA or type(t) is not dict or set(t) != live.trust_fields(t)
             or not live._guid(plan["worker_deployment_id"])
             or not live._hex(plan["observer_spki_sha256"],64)
             or plan["terminal_pub_key"] is not None
@@ -54,7 +57,8 @@ def _approved(raw, wanted):
             or not all(type(t[k]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,127}", t[k])
                        for k in ("resource_id","owner_id","datacenter_id"))
             or not all(type(t[k]) is int and 0<t[k]<4102444800
-                       for k in ("opened_at","stop_at","hard_deadline"))):
+                       for k in ("opened_at","stop_at","hard_deadline"))
+            or (t.get("qualification_mode")==SHORT_MODE and not short_window(*(t[k] for k in ("opened_at","stop_at","hard_deadline"))))):
         raise ValueError("Invalid pinned observer identity, window or approval")
     return plan
 
@@ -132,16 +136,19 @@ def _payload(t, instance):
     return {"batch":instance,"pod":t["resource_id"],"owner":t["owner_id"],
             "datacenter":t["datacenter_id"],"name":t["pod_name"],"startedAt":live._iso(t["opened_at"]),
             "stopAt":live._iso(t["stop_at"]),"deadline":live._iso(t["hard_deadline"]),
-            "gitSha":t["git_sha"],"profileSha256":t["profile_sha256"],"terminalPubKey":None}
+            "gitSha":t["git_sha"],"profileSha256":t["profile_sha256"],"terminalPubKey":None,
+            **({"qualificationMode":SHORT_MODE} if t.get("qualification_mode")==SHORT_MODE else {})}
 
 
 def _collect(plan, cf_token, pod_token):
     t=plan["linux_trust"]
     instance=str(uuid.UUID(hex=t["batch_id"]))
     base=f"/client/v4/accounts/{t['cloudflare_account_id']}"
-    wf=f"{base}/workflows/{CF_WORKFLOW}"
+    short=t.get("qualification_mode")==SHORT_MODE
+    worker_name,workflow_name=(CF_SHORT_WORKER,CF_SHORT_WORKFLOW) if short else (CF_WORKER,CF_WORKFLOW)
+    wf=f"{base}/workflows/{workflow_name}"
     instance_path=f"{wf}/instances/{instance}"
-    deploy_path=f"{base}/workers/scripts/{CF_WORKER}/deployments/{plan['worker_deployment_id']}"
+    deploy_path=f"{base}/workers/scripts/{worker_name}/deployments/{plan['worker_deployment_id']}"
     before=time.time()
     clock=time.monotonic()
     limit=clock+18
@@ -152,7 +159,7 @@ def _collect(plan, cf_token, pod_token):
     wf_ver=_result(cf(f"{wf}/versions/{t['workflow_version']}"))
     active=_result(cf(deploy_path))
     if ((wf_info.get("id"),wf_info.get("name"),wf_info.get("script_name"),wf_info.get("class_name")) !=
-            (t["workflow_id"],CF_WORKFLOW,CF_WORKER,CF_CLASS)
+            (t["workflow_id"],workflow_name,worker_name,CF_CLASS)
             or wf_info.get("script_deleted",False) is not False
             or (wf_ver.get("id"),wf_ver.get("workflow_id"),wf_ver.get("class_name"),wf_ver.get("language")) !=
                (t["workflow_version"],t["workflow_id"],CF_CLASS,"javascript")
@@ -163,7 +170,7 @@ def _collect(plan, cf_token, pod_token):
     payload=_payload(t,instance)
     bind={"batch":instance,"pod":t["resource_id"],"stopAt":payload["stopAt"],
           "deadline":payload["deadline"],"gitSha":t["git_sha"],"profileSha256":t["profile_sha256"],
-          "workerVersion":t["worker_version"]}
+          "workerVersion":t["worker_version"],**({"qualificationMode":SHORT_MODE} if short else {})}
     if set(arm)!=set(bind)|{"armedAtMs"} or any(arm.get(k)!=v for k,v in bind.items()):
         raise ValueError("Full binding result lacks exact runtime Worker version or released identity")
     account=pod("/v2/account")
@@ -194,7 +201,7 @@ def _collect(plan, cf_token, pod_token):
     if not 0<=elapsed<18 or not 0<=wall-before<19 or abs((wall-before)-elapsed)>2:
         raise ValueError("Trusted observer clock changed or request window elapsed")
     now=int(wall)
-    ev={k:t[k] for k in live.TRUST_KEYS-{"durable_root","snapshot","service_uid"}}
+    ev={k:t[k] for k in live.trust_fields(t)-{"durable_root","snapshot","service_uid"}}
     ev.update(schema="tcc-incremental-first-case-trusted-observation/v2",run_id=plan["run_id"],
               scenario_id=live.CASE,workflow_instance_id=instance,armed_at_ms=arm["armedAtMs"],
               observed_at=now,expires_at=now+60,status=record["status"],cloud="SECURE",

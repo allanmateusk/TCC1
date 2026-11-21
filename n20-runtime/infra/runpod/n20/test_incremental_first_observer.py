@@ -76,9 +76,12 @@ class ObserverTests(unittest.TestCase):
         if uri.hostname==observer.CF_HOST:
             self.assertEqual(request.get_header("Authorization"),"Bearer "+CF_TOKEN)
             base=f"/client/v4/accounts/{self.t['cloudflare_account_id']}"
-            wf=f"{base}/workflows/{observer.CF_WORKFLOW}"
+            short=self.t.get("qualification_mode") is not None
+            name=observer.CF_SHORT_WORKFLOW if short else observer.CF_WORKFLOW
+            name_worker=observer.CF_SHORT_WORKER if short else observer.CF_WORKER
+            wf=f"{base}/workflows/{name}"
             inst=f"{wf}/instances/{self.instance}"
-            dep=f"{base}/workers/scripts/{observer.CF_WORKER}/deployments/{self.plan['worker_deployment_id']}"
+            dep=f"{base}/workers/scripts/{name_worker}/deployments/{self.plan['worker_deployment_id']}"
             key={wf:"workflow",f"{wf}/versions/{self.t['workflow_version']}":"version",
                  dep:"deployment",inst:"instance",inst+"/step":"arm"}[uri.path]
             self.assertEqual(parse_qs(uri.query),{"name":[observer.ARM],"type":["step"]} if key=="arm" else {})
@@ -95,6 +98,30 @@ class ObserverTests(unittest.TestCase):
 
     def collect(self):
         return observer._collect(self.plan,CF_TOKEN,POD_TOKEN)
+
+
+    def test_short_observation_requires_the_separate_worker_and_exact_55_60_times(self):
+        from .incremental_batch_protection import SHORT_MODE
+        opened=self.t["opened_at"]
+        self.t.update(qualification_mode=SHORT_MODE,stop_at=opened+3300,hard_deadline=opened+3600)
+        self.responses["workflow"].update(name=observer.CF_SHORT_WORKFLOW,script_name=observer.CF_SHORT_WORKER)
+        payload=observer._payload(self.t,self.instance)
+        self.responses["instance"]["params"]=payload
+        self.responses["instance"]["steps"][1]["end"]=payload["stopAt"]
+        self.responses["arm"]["output"].update(qualificationMode=SHORT_MODE,
+                                              stopAt=payload["stopAt"],deadline=payload["deadline"])
+        approved=store.json_bytes(self.plan)
+        self.assertEqual(observer._approved(approved,store.sha(approved)),self.plan)
+        evidence=self.collect()
+        self.assertEqual(evidence["qualification_mode"],SHORT_MODE)
+        self.assertEqual(evidence["stop_at"]-evidence["opened_at"],3300)
+        self.assertEqual(evidence["hard_deadline"]-evidence["opened_at"],3600)
+        with self.assertRaises(ValueError):
+            live.verify_evidence(evidence,{k:v for k,v in self.t.items() if k!="qualification_mode"},
+                                 now=time.time(),profile=self.profile)
+        self.responses["workflow"]["script_name"]=observer.CF_WORKER
+        with self.assertRaisesRegex(ValueError,"release"):
+            self.collect()
 
     def test_exact_reads_accept_both_step_response_shapes(self):
         for wrap in (False,True):

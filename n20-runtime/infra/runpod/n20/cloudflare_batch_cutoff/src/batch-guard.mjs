@@ -1,6 +1,7 @@
 import { transport } from "./runpod-transport.mjs";
 
 const HOUR=3600000;
+export const SHORT_MODE="qualification-60m-two-case";
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ID=/^[A-Za-z0-9_-]{2,128}$/;
 const SHA=/^[0-9a-f]{64}$/;
@@ -25,19 +26,24 @@ export function utc(value) {
   if (!Number.isFinite(ms) || new Date(ms).toISOString()!==value) throw Error("INVALID_UTC");
   return ms;
 }
-export function pin(raw,payload,instance) {
-  if (!exact(raw,keys) || !exact(payload,keys) || !keys.every(k=>payload[k]===raw[k]) ||
+const planKeys=p=>p?.qualificationMode===SHORT_MODE?[...keys,"qualificationMode"]:keys;
+export function pin(raw,payload,instance,expectedMode=null) {
+  const fields=planKeys(raw);
+  if (!exact(raw,fields) || !exact(payload,fields) || !fields.every(k=>payload[k]===raw[k]) ||
+      ![null,SHORT_MODE].includes(expectedMode) || (raw.qualificationMode??null)!==expectedMode ||
       !UUID.test(raw.batch) || raw.batch!==instance || ![raw.pod,raw.owner,raw.datacenter].every(v=>typeof v==="string" && ID.test(v)) ||
       typeof raw.name!=="string" || !/^[A-Za-z0-9][A-Za-z0-9._ -]{0,99}$/.test(raw.name) ||
       typeof raw.gitSha!=="string" || !GIT.test(raw.gitSha) || typeof raw.profileSha256!=="string" || !SHA.test(raw.profileSha256))
     throw Error("DISARMED_OR_WRONG_BATCH");
   if (raw.terminalPubKey!==null) rawB64(raw.terminalPubKey,32);
   const start=utc(raw.startedAt), wake=utc(raw.stopAt), end=utc(raw.deadline);
-  if (end-start<4*HOUR || end-start>7*HOUR || end-wake!==300000)
+  const short=expectedMode===SHORT_MODE;
+  if (short ? (end-start!==HOUR || wake-start!==55*60000 || raw.terminalPubKey!==null)
+            : (end-start<4*HOUR || end-start>7*HOUR || end-wake!==300000))
     throw Error("UNAPPROVED_BATCH_WINDOW");
-  return Object.freeze({...Object.fromEntries(keys.map(k=>[k,raw[k]])),start,wake,end});
+  return Object.freeze({...Object.fromEntries(fields.map(k=>[k,raw[k]])),start,wake,end});
 }
-export function planId(plan) { return JSON.stringify(keys.map(k=>plan[k])); }
+export function planId(plan) { return JSON.stringify(planKeys(plan).map(k=>plan[k])); }
 export function armTime(plan,now) {
   if (!validArm(plan,now)) throw Error("ARM_WITHIN_FIVE_MINUTES");
 }
@@ -129,7 +135,8 @@ export async function runCutoffWorkflow(plan,step,{now,arm,perform,workerVersion
     const armedAtMs=await arm();
     if (!validArm(plan,armedAtMs) || armedAtMs>now()) throw Error("UNVERIFIED_OR_REUSED_POD_BINDING");
     return {batch:plan.batch,pod:plan.pod,armedAtMs,workerVersion,stopAt:plan.stopAt,deadline:plan.deadline,
-            gitSha:plan.gitSha,profileSha256:plan.profileSha256};
+            gitSha:plan.gitSha,profileSha256:plan.profileSha256,
+            ...(plan.qualificationMode===SHORT_MODE?{qualificationMode:SHORT_MODE}:{})};
   });
   await step.sleepUntil("absolute-batch-cutoff",new Date(plan.wake));
   return step.do("cutoff-stop-or-reconcile",noRetry,perform);

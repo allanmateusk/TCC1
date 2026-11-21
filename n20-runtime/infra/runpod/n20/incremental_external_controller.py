@@ -51,6 +51,7 @@ class Controller:
         binds=("batch_id","resource_id","owner_id","datacenter_id","pod_name","git_sha",
                "profile_sha256","opened_at","stop_at","hard_deadline")
         if (any(t[name]!=getattr(a,name) for name in binds)
+                or t.get("qualification_mode")!=getattr(a,"qualification_mode",None)
                 or (t["workflow_version"],t["worker_version"])!=(s.guard_version_id,s.worker_version_id)
                 or not warm._uuid(p["run_id"]) or p["run_id"]==a.batch_id):
             raise ValueError("Cold observer approval and warm scope do not match")
