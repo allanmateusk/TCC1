@@ -252,6 +252,23 @@ class Journal:
             db.execute("UPDATE cases SET receipt_sha=? WHERE idx=?",(receipt_sha,row["idx"]))
         return lease_sha
 
+    def finalize_second(self,readback):
+        """Durably record exact case two GET, never issue any further lease."""
+        r,receipt_sha=self.authorities.validate(readback,GET,self._now())
+        with self._txn() as db:
+            now=self._still_fresh([r])
+            rows=db.execute("SELECT * FROM cases ORDER BY idx").fetchall()
+            if len(rows)!=2 or rows[0]["idx"]!=0 or rows[0]["receipt_sha"] is None:
+                raise ValueError("There is no independently verified first-to-second transition")
+            row=rows[1]
+            if (r["index"]!=1 or row["receipt_sha"] is not None or row["sealed"] is None
+                    or (r["index"],r["run_id"],r["sha256"],r["size"]) !=
+                       (row["idx"],row["run_id"],row["seal_sha"],row["seal_size"])
+                    or not row["sealed"]<=r["observed_at"]<=now<row["cutoff"]):
+                raise ValueError("Second case is not ready for an exact live GET receipt")
+            db.execute("UPDATE cases SET receipt_sha=? WHERE idx=1",(receipt_sha,))
+        return receipt_sha
+
     def status(self):
         with self._txn() as db:
             return [dict(r) for r in db.execute("SELECT idx,run_id,lease_sha,receipt_sha FROM cases ORDER BY idx")]

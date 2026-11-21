@@ -182,3 +182,73 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.gets,1)
         self.assertEqual(self.controller.journal.status(),clean)
         self.assertFalse((self.root/control.RELAY_FILE).exists())
+
+    def test_case_two_role_upload_and_independent_get_terminal_no_third(self):
+        from . import campaign_profiles as cp
+
+        first,grant,url=self.setup_first()
+        relay=self.second(first,grant,url)
+        e=relay["next_lease"]["evidence"]
+        release=replace(first.release,run_id=e["run_id"],launch_evidence_sha256=e["guard_observation_sha256"])
+        tr=replace(first,release=release)
+        self.now+=20
+        b=BytesIO()
+        with ZipFile(b,"w") as z:
+            z.writestr(store.MANIFEST,store.json_bytes({"git_sha":self.t["git_sha"],"case":warm.IDS[1]}))
+        body=b.getvalue()
+        profile=cp.resolve("incremental-v1")
+        row=next(r for r in profile["scenarios"] if r["id"]==warm.IDS[1])
+        p=cp.plan(profile,row,0,50)
+        case2={"scenario_id":warm.IDS[1],"campaign_id":profile["schema"],"profile_sha256":self.t["profile_sha256"],
+              "run_kind":"official","nodes":20,"rounds":50,"verified_own_generations":1000,"verified_ledgers":20,
+              "verified_audit_rounds":p["planned_rounds"],"verified_genesis_rounds":p["genesis_rounds"],
+              "verified_intentional_absences":sum(map(len,p["simulated_absences"].values()))}
+        with patch.object(store,"verify_archive",return_value=case2):
+            seal=self.controller.seal_second(archive=body,transfer_trust=tr)
+            oid=f"tcc/prod/incremental-v1/n20-{release.run_id}.zip"
+            def grant_for(method, schema=transfer.SECOND_SCHEMA):
+                signed_url=r2_pilot_prompt._presign(method,host=self.endpoint[8:],path="/tcc/"+oid,region="auto",
+                  access_key_id="A"*32,secret_key="B"*64,now=datetime.fromtimestamp(self.now,timezone.utc),expires=40)
+                evidence={"schema":schema,"release":asdict(release),"method":method,"scenario_id":warm.IDS[1],
+                  "campaign_id":profile["schema"],"bucket":"tcc","key":oid,"sha256":seal["sha256"],"size":seal["size"],
+                  "deadline":self.now+50,"observed_at":self.now,"guard_phase":"running","sleep_name":"absolute-batch-cutoff",
+                  "sleep_end":release.stop_at,"url_sha256":store.sha(signed_url.encode("ascii"))}
+                return observer._sign(evidence,self.keys["publication"],self.openssl,self.pins["publication"]),signed_url
+            def finish(grant,url):
+                return self.controller.finalize_second(transfer_trust=tr,get_envelope=grant,get_url=url,
+                    cf_read_token="cf-fixture",pod_read_token="pod-fixture")
+            with self.assertRaises(ValueError):
+                finish(*grant_for("GET",transfer.SCHEMA))
+            writes=[]
+            bucket={}
+            def second_op(req,*,timeout):
+                if req.get_method()=="PUT":
+                    self.assertEqual(req.get_header("If-none-match"),"*")
+                    writes.append(req.data)
+                    bucket[oid]=req.data
+                    return Reply()
+                return Reply(bucket.get(oid,b""))
+            with patch.object(tx,"tls_opener",return_value=second_op):
+                put,put_url=grant_for("PUT")
+                pod=self.root/"isolated-fixture-pod"
+                pod.mkdir()
+                self.assertEqual(transfer.publish_second_from_pod(trust=tr,put_envelope=put,put_url=put_url,
+                      archive=body,journal_dir=pod),"put_ack_not_verified")
+                self.assertEqual(transfer.publish_second_from_pod(trust=tr,put_envelope=put,put_url=put_url,
+                      archive=body,journal_dir=pod),"already_attempted_get_only")
+                self.assertEqual(writes,[body])
+                self.assertFalse((self.root/control.FINAL_FILE).exists())
+                bucket[oid]=bytes(len(body))
+                with self.assertRaises(tx.TransferError):
+                    finish(*grant_for("GET"))
+                self.assertFalse((self.root/control.FINAL_FILE).exists())
+                bucket[oid]=body
+                result=finish(*grant_for("GET"))
+                self.assertEqual(result["qualified"]["evidence"]["verified_cases"],2)
+                self.assertFalse(result["qualified"]["evidence"]["next_case_authorized"])
+                self.assertFalse(result["qualified"]["evidence"]["stop_authorized"])
+                self.assertEqual(set(result),{"readback","qualified"})
+                self.assertEqual(len(self.reopen().journal.status()),2)
+                self.assertTrue(all(x["receipt_sha"] for x in self.reopen().journal.status()))
+                with self.assertRaises(ValueError):
+                    finish(*grant_for("GET"))

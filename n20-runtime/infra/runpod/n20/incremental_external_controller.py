@@ -20,6 +20,9 @@ APPROVAL="tcc-warm-flight-controller-approval/v1"
 FIRST_FILE="controller-first.json"
 SEAL_FILE="controller-first-seal.json"
 RELAY_FILE="controller-second-relay.json"
+SECOND_SEAL_FILE="controller-second-seal.json"
+FINAL_FILE="controller-two-case-terminal.json"
+QUALIFIED="tcc-warm-two-case-qualification-terminal/v1"
 
 
 @dataclass(frozen=True)
@@ -218,3 +221,80 @@ class Controller:
             raise ValueError("Committed relay expired before publication; do not rerun")
         self._write(RELAY_FILE,relay)
         return relay
+
+    def _second_entry(self):
+        relay=self._load(RELAY_FILE)
+        if set(relay)!={"readback","next_lease","committed"}:
+            raise ValueError("Missing exact committed second lease")
+        r,e,c=(relay[k]["evidence"] for k in ("readback","next_lease","committed"))
+        receipt_sha=store.sha(store.json_bytes(r))
+        lease_sha=store.sha(store.json_bytes(e))
+        status=self.journal.status()
+        if (len(status)!=2 or c.get("receipt_sha256")!=receipt_sha or c.get("lease_sha256")!=lease_sha
+                or status[0]["idx"]!=0 or status[0]["receipt_sha"]!=receipt_sha
+                or status[1]!={"idx":1,"run_id":e["run_id"],"lease_sha":lease_sha,"receipt_sha":None}
+                or e["index"]!=1 or e["scenario_id"]!=warm.IDS[1]
+                or self._now()>=e["case_deadline"]):
+            raise ValueError("No unfinalized exact second case before cutoff")
+        return e,receipt_sha
+
+    def seal_second(self,*,archive,transfer_trust):
+        """Validate case two independently before a publisher grants its one PUT."""
+        e,_=self._second_entry()
+        guard_sha=e["guard_observation_sha256"]
+        self._transfer_trust(transfer_trust,e,guard_sha)
+        proof=transfer.inspect_second_archive(archive,transfer_trust.release)
+        self.journal.seal_active(e["run_id"],**proof)
+        record={"run_id":e["run_id"],"guard_observation_sha256":guard_sha,**proof}
+        self._write(SECOND_SEAL_FILE,record)
+        return record
+
+    def finalize_second(self,*,transfer_trust,get_envelope,get_url,cf_read_token,pod_read_token):
+        """Finish the two-case qualification only after exact second archive GET."""
+        e,prior_receipt=self._second_entry()
+        guard_sha=e["guard_observation_sha256"]
+        self._transfer_trust(transfer_trust,e,guard_sha)
+        if (self.state_dir/FINAL_FILE).exists():
+            raise ValueError("Already finalized; do not rerun")
+        seal=self._load(SECOND_SEAL_FILE)
+        grant=get_envelope.get("evidence") if type(get_envelope) is dict else None
+        if (set(seal)!={"run_id","guard_observation_sha256","sha256","size"}
+                or (seal["run_id"],seal["guard_observation_sha256"])!=(e["run_id"],guard_sha)
+                or type(grant) is not dict or (grant.get("sha256"),grant.get("size"))!=(seal["sha256"],seal["size"])
+                or type(grant.get("deadline")) is not int or grant["deadline"]>e["case_deadline"]):
+            raise ValueError("Second GET grant does not match the protected seal and case cutoff")
+        proof=transfer.verify_second_at_controller(trust=transfer_trust,get_envelope=get_envelope,
+                                                   get_url=get_url,receipt_dir=self.state_dir)
+        if (proof["schema"]!=transfer.SECOND_READBACK or proof["run_id"]!=e["run_id"] or
+                (proof["sha256"],proof["bytes"])!=(seal["sha256"],seal["size"])):
+            raise ValueError("Exact second-case readback unavailable")
+        verified_at=self._now()
+        after=math.ceil(verified_at)
+        if after>=e["case_deadline"]:
+            raise ValueError("Second verification expired before terminal proof")
+        if after>verified_at:
+            time.sleep(after-verified_at)
+        observed=int(self._now())
+        guard=self._observe(cf_read_token,pod_read_token)
+        if guard["evidence"]["observed_at"]<observed:
+            raise ValueError("Final guard observation precedes second readback")
+        record={"schema":warm.GET,"scope_sha256":self._scope.digest,"index":1,"scenario_id":warm.IDS[1],
+                "run_id":e["run_id"],"observed_at":observed,"expires_at":min(observed+60,e["case_deadline"]),
+                "method":"GET","bucket":"tcc","key":proof["key"],"sha256":proof["sha256"],"size":proof["bytes"],
+                "verified_own_generations":1000,"verified_ledgers":20,"rounds":50,"nodes":20,
+                "archive_verified":True,"independent_get":True}
+        signed_readback=self._sign(record,warm.GET)
+        digest=self.journal.finalize_second(signed_readback)
+        status=self.journal.status()
+        if (len(status)!=2 or status[0]["receipt_sha"]!=prior_receipt
+                or (status[1]["idx"],status[1]["run_id"],status[1]["receipt_sha"])!=(1,e["run_id"],digest)):
+            raise ValueError("No durable terminal confirmation for exactly two cases")
+        g=guard["evidence"]
+        final={"schema":QUALIFIED,"scope_sha256":self._scope.digest,"run_id":e["run_id"],
+               "first_receipt_sha256":prior_receipt,"second_receipt_sha256":digest,
+               "verified_cases":2,"next_case_authorized":False,"stop_authorized":False,
+               "guard_observation_sha256":store.sha(store.json_bytes(g)),"committed_at":int(self._now())}
+        self._write("controller-fresh-guard-"+final["guard_observation_sha256"]+".json",guard)
+        result={"readback":signed_readback,"qualified":self._sign(final,warm.LEASE)}
+        self._write(FINAL_FILE,result)
+        return result

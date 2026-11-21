@@ -20,11 +20,15 @@ from urllib.parse import parse_qs, urlsplit
 from zipfile import ZipFile
 
 from . import artifact_store as store, campaign_profiles as cp, incremental_transport as tx, r2_grants
+from .incremental_campaign import IDS
 
 CASE = "e4-c0-m00-p10-exact-u00-s0"
 SCHEMA = "tcc-incremental-first-case-publication/v1"
 READBACK = "tcc-incremental-first-case-independent-readback/v1"
 AUDITS = [10, 20, 30, 40, 50]
+SECOND_CASE = IDS[1]
+SECOND_SCHEMA = "tcc-incremental-second-case-publication/v1"
+SECOND_READBACK = "tcc-incremental-second-case-independent-readback/v1"
 
 
 def _hex(value, length):
@@ -106,7 +110,8 @@ def _verified_signature(trust, evidence, signature):
             raise ValueError("Publication proof signature not verified")
 
 
-def _authorize_envelope(trust, envelope, url, method, *, now):
+def _authorize_envelope(trust, envelope, url, method, *, now, case=CASE):
+    schema = {CASE:SCHEMA, SECOND_CASE:SECOND_SCHEMA}[case]
     if (type(trust) is not TransferTrust or type(envelope) is not dict
             or set(envelope) != {"evidence","signature_ed25519_base64"}
             or type(url) is not str or not 0<len(url)<4096):
@@ -115,9 +120,9 @@ def _authorize_envelope(trust, envelope, url, method, *, now):
     fields = {"schema","release","method","scenario_id","campaign_id","bucket","key","sha256","size",
               "deadline","observed_at","guard_phase","sleep_name","sleep_end","url_sha256"}
     p = trust.release
-    if (type(ev) is not dict or set(ev)!=fields or ev["schema"]!=SCHEMA
+    if (type(ev) is not dict or set(ev)!=fields or ev["schema"]!=schema
             or type(ev["release"]) is not dict or ev["release"]!=asdict(p)
-            or ev["method"]!=method or ev["scenario_id"]!=CASE
+            or ev["method"]!=method or ev["scenario_id"]!=case
             or ev["campaign_id"]!=cp.INCREMENTAL_SCHEMA or ev["bucket"]!="tcc"
             or ev["guard_phase"] not in ("running","waiting") or ev["sleep_name"]!="absolute-batch-cutoff"
             or type(ev["sleep_end"]) is not int or ev["sleep_end"]!=p.stop_at
@@ -127,7 +132,7 @@ def _authorize_envelope(trust, envelope, url, method, *, now):
             or not now<ev["deadline"]<=min(p.stop_at,ev["observed_at"]+300)):
         raise ValueError("Publication proof does not match the fresh exact guard, role or grant")
     _verified_signature(trust, ev, envelope["signature_ed25519_base64"])
-    scope = tx.Scope(p.run_id,CASE,cp.INCREMENTAL_SCHEMA,p.profile_sha256,"tcc",ev["key"],
+    scope = tx.Scope(p.run_id,case,cp.INCREMENTAL_SCHEMA,p.profile_sha256,"tcc",ev["key"],
                      ev["sha256"],ev["size"],ev["deadline"])
     cfg = trust.config()
     stamp = datetime.fromtimestamp(now, timezone.utc)
@@ -140,22 +145,38 @@ def _authorize_envelope(trust, envelope, url, method, *, now):
     return scope, cfg, stamp
 
 
-def inspect_sealed_archive(data, release):
-    """Controller sealer checks manifest+ZIP before a post-run grant may be signed."""
-    if type(release) is not PinnedRelease or type(data) is not bytes:
-        raise ValueError("Exact release and immutable ZIP bytes required")
+def _inspect_archive(data, release, case):
+    if type(release) is not PinnedRelease or type(data) is not bytes or case not in (CASE,SECOND_CASE):
+        raise ValueError("Exact two-case release and immutable ZIP bytes required")
     facts = store.verify_archive(data, release.run_id)
-    expected = {"scenario_id":CASE,"campaign_id":cp.INCREMENTAL_SCHEMA,
+    expected = {"scenario_id":case,"campaign_id":cp.INCREMENTAL_SCHEMA,
                 "profile_sha256":release.profile_sha256,"run_kind":"official","nodes":20,"rounds":50,
                 "verified_own_generations":1000,"verified_ledgers":20,"verified_audit_rounds":AUDITS,
                 "verified_genesis_rounds":[],"verified_intentional_absences":0}
+    if case==SECOND_CASE:
+        profile = cp.resolve("incremental-v1")
+        row = next(r for r in profile["scenarios"] if r["id"]==case)
+        plan = cp.plan(profile,row,0,50)
+        expected.update(verified_audit_rounds=plan["planned_rounds"],
+                        verified_genesis_rounds=plan["genesis_rounds"],
+                        verified_intentional_absences=sum(map(len,plan["simulated_absences"].values())))
     if any(facts.get(k)!=v for k,v in expected.items()):
-        raise ValueError("ZIP does not verify the exact first-case semantics")
+        raise ValueError("ZIP does not verify the exact pinned case semantics")
     with ZipFile(BytesIO(data)) as zipped:
         manifest = json.loads(zipped.read(store.MANIFEST))
     if manifest.get("git_sha")!=release.git_sha:
         raise ValueError("ZIP does not prove the approved Git SHA")
     return {"sha256":store.sha(data),"size":len(data)}
+
+
+def inspect_sealed_archive(data, release):
+    """Controller checks case one before a post-run grant may be signed."""
+    return _inspect_archive(data,release,CASE)
+
+
+def inspect_second_archive(data, release):
+    """Controller checks only case two before a post-run grant may be signed."""
+    return _inspect_archive(data,release,SECOND_CASE)
 
 
 def _authorization(scope, method):
@@ -170,21 +191,31 @@ def _protected_directory(directory):
     return p
 
 
-def publish_from_pod(*, trust, put_envelope, put_url, archive, journal_dir):
-    """Call only on Pod; pass neither reader URL nor long-lived key to this role."""
+def _publish(*, trust, put_envelope, put_url, archive, journal_dir, case):
     now=time.time()
-    scope,cfg,stamp=_authorize_envelope(trust,put_envelope,put_url,"PUT",now=now)
-    sealed=inspect_sealed_archive(archive,trust.release)
+    scope,cfg,stamp=_authorize_envelope(trust,put_envelope,put_url,"PUT",now=now,case=case)
+    sealed=_inspect_archive(archive,trust.release,case)
     if sealed!={"sha256":scope.sha256,"size":scope.size}:
         raise ValueError("ZIP does not match the signed independent seal")
     return tx.pod_put_once(scope,archive,cfg,put_url,journal_dir,
                            authorize=_authorization(scope,"PUT"),opener=tx.tls_opener(),now=stamp)
 
 
-def verify_at_controller(*, trust, get_envelope, get_url, receipt_dir):
-    """Read separately, issuing proof only in the controller's protected directory."""
+def publish_from_pod(*, trust, put_envelope, put_url, archive, journal_dir):
+    """Case one Pod role; never provide reader URL or a long-lived key."""
+    return _publish(trust=trust,put_envelope=put_envelope,put_url=put_url,archive=archive,
+                    journal_dir=journal_dir,case=CASE)
+
+
+def publish_second_from_pod(*, trust, put_envelope, put_url, archive, journal_dir):
+    """Case two Pod role; a case one grant cannot be used here."""
+    return _publish(trust=trust,put_envelope=put_envelope,put_url=put_url,archive=archive,
+                    journal_dir=journal_dir,case=SECOND_CASE)
+
+
+def _verify(*, trust, get_envelope, get_url, receipt_dir, case):
     now=time.time()
-    scope,cfg,stamp=_authorize_envelope(trust,get_envelope,get_url,"GET",now=now)
+    scope,cfg,stamp=_authorize_envelope(trust,get_envelope,get_url,"GET",now=now,case=case)
     directory=_protected_directory(receipt_dir)
     receipt=tx.verify_get(scope,cfg,get_url,authorize=_authorization(scope,"GET"),
                           opener=tx.tls_opener(),now=stamp)
@@ -195,7 +226,18 @@ def verify_at_controller(*, trust, get_envelope, get_url, receipt_dir):
         raise ValueError("Invalid independent readback result")
     # The signer verified the case and Git on the pre-upload seal. Readback revalidates
     # archive semantics and proves it is byte-for-byte that same protected seal.
-    result={**receipt,"schema":READBACK,"release":asdict(trust.release),
+    schema,suffix = (READBACK,"first") if case==CASE else (SECOND_READBACK,"second")
+    result={**receipt,"schema":schema,"release":asdict(trust.release),
             "eligible_for_next_case":False,"eligible_for_batch_completion":False}
-    store.write_atomic(directory/(scope.run_id+".first-case-readback.json"),store.json_bytes(result))
+    store.write_atomic(directory/(scope.run_id+f".{suffix}-case-readback.json"),store.json_bytes(result))
     return result
+
+
+def verify_at_controller(*, trust, get_envelope, get_url, receipt_dir):
+    """Case one readback lives only on the controller's protected mount."""
+    return _verify(trust=trust,get_envelope=get_envelope,get_url=get_url,receipt_dir=receipt_dir,case=CASE)
+
+
+def verify_second_at_controller(*, trust, get_envelope, get_url, receipt_dir):
+    """Case two readback; neither this proof nor the launcher grants a third case."""
+    return _verify(trust=trust,get_envelope=get_envelope,get_url=get_url,receipt_dir=receipt_dir,case=SECOND_CASE)

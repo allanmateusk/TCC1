@@ -31,9 +31,21 @@ tokens ou credenciais no plano, no Git ou no Pod. O código não instala ACL.
    commit e antes da entrega? Não repita a execução. Preserve a prova e
    investigue o diário; o guard externo continua sendo a única parada.
 
-Fixtures locais usam HTTP falso e chaves efêmeras; nenhuma chave, Pod ou
-R2 real foi usado. Ainda é necessário verificar o Workflow hospedado e
-a observação autenticada, o instalador Linux e a entrega da lease no
-supervisor, o endpoint R2, as permissões, o assinador e o canal de cópia.
-A conclusão do segundo cenário precisa de GET separado; não confundir
-a transição 1→2 com dois resultados oficiais verificados.
+4. `Controller.seal_second` valida o ZIP e o lease exatos do segundo
+   cenário, sem tratar o sucesso do primeiro como prova do segundo. O
+   assinador de publicação emite envelopes dedicados
+   `tcc-incremental-second-case-publication/v1`, ligados à evidência fresca
+   da segunda lease. No Pod, `publish_second_from_pod` faz o PUT condicional;
+   fora dele, `Controller.finalize_second` faz GET independente, reobserva o
+   guard e registra o segundo recibo no diário em transação. O terminal
+   `tcc-warm-two-case-qualification-terminal/v1` comprova só os dois
+   readbacks. Não autoriza cenário 3, publicação de conclusão de 20 casos
+   ou STOP. O guard do prazo não foi alterado.
+
+Fixtures locais usam HTTP falso e chaves efêmeras; os testes validam
+assinaturas, bytes e transições, mas as métricas científicas da fixture
+são sintéticas. Nenhuma chave, Pod ou R2 real foi usado. Ainda é necessário
+verificar o Workflow hospedado, o instalador Linux e entrega no supervisor,
+endpoint/permissões R2, assinador de publicação e canal autenticado de cópia.
+Faça um teste R2 explícito e separado antes de Start; hardware e preço
+concretos também permanecem uma decisão separada.
