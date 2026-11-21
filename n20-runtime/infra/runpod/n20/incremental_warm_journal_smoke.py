@@ -19,6 +19,7 @@ from . import incremental_warm_smoke as smoke, warm_batch
 from .incremental_batch_protection import BatchProtection
 from .incremental_campaign import IDS
 from .incremental_warm_journal import Authorities, GET, Journal, LEASE, Scope, _key_der
+from .incremental_warm_live import COMMITTED, Seal, verify_transition
 
 ORIGINAL=warm_batch.run_incremental_candidate
 PAST=1767323045
@@ -113,12 +114,23 @@ class FixtureBridge:
                 raise ValueError("Fixture Pod or batch changed")
             index=len(self.ordered)
             if index==0:
-                self.ctrl.first(self._lease(0,rid,None))
+                first_lease=self._lease(0,rid,None)
+                self.first_lease=first_lease["evidence"]
+                self.ctrl.first(first_lease)
             elif index==1:
                 if self.readback is None:
                     raise DeniedReadback("No independently verified fixture GET")
                 prior=store.sha(store.json_bytes(self.readback["evidence"]))
-                self.ctrl.transition(self.readback,self._lease(1,rid,prior))
+                next_lease=self._lease(1,rid,prior)
+                lease_sha=self.ctrl.transition(self.readback,next_lease)
+                committed_at=self.clock()
+                commit=self._sign(dict(schema=COMMITTED,scope_sha256=self.scope.digest,
+                  receipt_sha256=prior,lease_sha256=lease_sha,index=1,run_id=rid,committed_at=committed_at,
+                  expires_at=min(self.readback["evidence"]["expires_at"],next_lease["evidence"]["expires_at"])),"lease")
+                relay={"readback":self.readback,"next_lease":next_lease,"committed":commit}
+                approval=verify_transition(self.ctrl.authorities,relay,prior=self.first_lease,
+                       seal=Seal(self.ordered[0],IDS[0],*self.bundle),now=self.clock())
+                assert approval["run_id"]==rid and approval["scenario_id"]==IDS[1]
                 assert len(self.protocol)==21, "second case started before signed journal transition"
             else:
                 raise AssertionError("Never execute more than two local fixture cases")

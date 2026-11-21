@@ -20,7 +20,7 @@ from sistema.node.resident import ResidentError, exchange
 class ResidentPool:
     """Own process lifetime and one lease at a time. No cloud calls here."""
 
-    def __init__(self, root, *, deadline, start_process=None):
+    def __init__(self, root, *, deadline, start_process=None, incremental_admission=None):
         root=Path(root)
         if not root.is_absolute() or root.resolve(strict=True)!=root or not root.is_dir():
             raise ValueError("Resident pool needs an exact durable root")
@@ -30,7 +30,13 @@ class ResidentPool:
         self.deadline=deadline
         # The private test transport only substitutes the subprocess launch, not the worker.
         self._spawn=start_process or subprocess.Popen
+
         self.test_transport=start_process is not None
+        if incremental_admission is not None:
+            from infra.runpod.n20.incremental_warm_live import WarmAdmission
+            if self.test_transport or type(incremental_admission) is not WarmAdmission:
+                raise ValueError("Only a protected real admission may arm incremental residents")
+        self.incremental_admission=incremental_admission
         self._lock=Lock()
         self.children={}
         self.scope_options=None
@@ -132,6 +138,14 @@ class ResidentPool:
             self.state="verified"
 
 
+    def _accept_incremental_readback(self, admission):
+        from infra.runpod.n20.incremental_warm_live import WarmAdmission
+        with self._lock:
+            if (self.test_transport or type(admission) is not WarmAdmission or admission is not self.incremental_admission
+                or self.closed or self.state!="complete" or not admission.matches_release(self.previous)):
+                raise ValueError("No verified incremental readback and next lease")
+            self.state="verified"
+
     def _admission(self, identity, resume):
         case=(identity.run_id,identity.scenario_id)
         if self.closed or time.time()>=self.deadline:
@@ -178,7 +192,11 @@ class ResidentPool:
             assignment={node:devices[gpu] for node,(gpu,_) in specifications.items()}
             campaign_scope=(identity.campaign_id,identity.profile_sha256)
             if campaign_scope[0] is not None and not self.test_transport:
-                raise ValueError('Real incremental residents remain unqualified')
+                if self.incremental_admission is None:
+                    raise ValueError("Real incremental residents remain unqualified")
+                self.incremental_admission.assert_identity(identity,end)
+            elif self.incremental_admission is not None:
+                raise ValueError("A protected incremental pool cannot run another campaign")
             pinned=(options,assignment,identity.git_sha,identity.tasks_sha256,campaign_scope)
             if self.scope_options is not None and self.scope_options!=pinned:
                 raise ValueError("Resident model, revision, worker code, task fixture or GPU assignment changed")

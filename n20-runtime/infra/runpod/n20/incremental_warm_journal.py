@@ -117,11 +117,18 @@ class Authorities:
                     "rounds":50,"nodes":20,"verified_own_generations":1000,"verified_ledgers":20}.items())
                 or ev["archive_verified"] is not True or ev["independent_get"] is not True):
                 raise ValueError("No independently verified exact archive GET")
-        signature=envelope["signature_ed25519_base64"]
+        raw=self.verify_signature(ev,envelope["signature_ed25519_base64"],kind=kind)
+        # New canonical copy avoids a mutable caller object during transaction.
+        return json.loads(raw),sha(raw)
+
+
+    def verify_signature(self,evidence,signature,*,kind):
+        if kind not in (LEASE,GET):
+            raise ValueError("Unknown authority role")
         if type(signature) is not str or len(signature)!=88:
             raise ValueError("Missing Ed25519 signature")
         sig=base64.b64decode(signature,validate=True)
-        raw=json_bytes(ev)
+        raw=json_bytes(evidence)
         if len(sig)!=64 or len(raw)>4096:
             raise ValueError("Invalid signed statement")
         pem=self.lease_pem if kind==LEASE else self.readback_pem
@@ -138,8 +145,7 @@ class Authorities:
                              check=False,timeout=5)
         if r.returncode!=0:
             raise ValueError("Independent authority signature invalid")
-        # New canonical copy avoids a mutable caller object during transaction.
-        return json.loads(raw),sha(raw)
+        return raw
 
 
 class Journal:

@@ -154,3 +154,40 @@ class WarmJournalTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.j.transition(fresh,self.lease(1,RUN2,self.hash_proof(fresh)))
         self.assertEqual(self.j.status(),started)
+
+
+    def _accepted_relay(self):
+        from .incremental_warm_live import COMMITTED, Seal
+        started=self.lease(0,RUN1)
+        self.j.first(started)
+        self.now+=1
+        self.j.seal_active(RUN1,sha256="3"*64,size=1234)
+        self.now+=1
+        get=self.get(0,RUN1)
+        nxt=self.lease(1,RUN2,self.hash_proof(get))
+        lease_sha=self.j.transition(get,nxt)
+        commit=self._sign(dict(schema=COMMITTED,scope_sha256=self.scope.digest,receipt_sha256=self.hash_proof(get),
+           lease_sha256=lease_sha,index=1,run_id=RUN2,committed_at=self.now,expires_at=self.now+15),"observer")
+        return started["evidence"],Seal(RUN1,IDS[0],"3"*64,1234),{"readback":get,"next_lease":nxt,"committed":commit}
+
+    def test_runtime_requires_committed_signature_and_unchanged_seal(self):
+        from .incremental_warm_live import verify_transition
+        prior,seal,relay=self._accepted_relay()
+        self.assertEqual(verify_transition(self.trust,relay,prior=prior,seal=seal,now=self.now)["run_id"],RUN2)
+        for bad in (None,{k:v for k,v in relay.items() if k!="committed"},
+                    {**relay,"committed":self._sign(relay["committed"]["evidence"],"rogue")}):
+            with self.assertRaises(ValueError):
+                verify_transition(self.trust,bad,prior=prior,seal=seal,now=self.now)
+        for invalid in (replace(seal,sha256="6"*64),replace(seal,size=1233),replace(seal,run_id=RUN2)):
+            with self.assertRaises(ValueError):
+                verify_transition(self.trust,relay,prior=prior,seal=invalid,now=self.now)
+        with self.assertRaises(ValueError):
+            verify_transition(self.trust,relay,prior=prior,seal=seal,now=self.now+16)
+
+    def test_default_platform_gate_stops_before_any_resident(self):
+        from unittest.mock import patch
+        from . import incremental_warm_live as live
+        with patch.object(live.first.sys,"platform","win32"),patch.object(
+                live,"ResidentPool",side_effect=AssertionError("No GPU path may be reached")):
+            with self.assertRaisesRegex(ValueError,"Protected Linux"):
+                live.supervise_two_cases()
