@@ -1,19 +1,22 @@
 """Offline fixture checks for evidence and transport. These files are not real runs."""
-from contextlib import closing
 from datetime import datetime, timezone
 import csv
 import io
 import hashlib
 import json
-import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+import sys
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 
 from sistema.core.ledger import Ledger, RoundRecord
+from sistema.node.dedicated_inference import DedicatedModel
 from sistema.scripts.runpod_worker import child_environment
+from sistema.scripts import runpod_worker as worker
 from . import artifact_store as store
 from . import r2_verified_pilot as r2
 from . import watchdog
@@ -42,16 +45,44 @@ def csv_bytes(rows):
 
 
 
+class CapturedNodeLaunch(Exception):
+    pass
+
+
+def checkpointed_worker_node_env(root, config, entry, profile, scenario):
+    # Capture the actual environment at Popen (never spawn a worker or load a model).
+    captured={}
+    (root/"test-model").mkdir()
+    def capture(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        raise CapturedNodeLaunch
+    with patch.object(worker.subprocess,"Popen",side_effect=capture):
+        try:
+            worker.execute_scenario(root,{**entry,"checkpoint_capture":{
+                "run_id":RUN,"git_sha":"8"*40,"tasks_sha256":profile["task_sha256"],
+                "scenario_id":scenario}},config,root/"test-model",["fixture-0","fixture-1"],
+                lambda:None,lambda *_args,**_kwargs:None)
+        except CapturedNodeLaunch:
+            pass
+        else:
+            raise AssertionError("Expected the checkpointed worker to attempt a node launch")
+    if captured.get("NODE_ID")!="node-0":
+        raise AssertionError("Missing node startup environment")
+    return captured
+
+
 def fixture(root, *, missing_quorum=False, scenario="pilot"):
     from . import benchmark
     profile, cases = benchmark.load_profile()
-    _,entry = benchmark.scenario_args(profile,cases[scenario],0)
+    config,entry = benchmark.scenario_args(profile,cases[scenario],0)
+    boot=checkpointed_worker_node_env(root,config,entry,profile,scenario)
     for d in ("ledgers","node-models"):
         (root/d).mkdir()
     plan=entry["audit_plan"]
     n_rounds=entry["rounds"]
     genesis, audits, fixed=(set(plan[k]) for k in ("genesis_rounds","planned_rounds","fixed_test_rounds"))
-    tasks=[t["id"] for t in json.loads((benchmark.ROOT/profile["task_file"]).read_text(encoding="utf-8"))["tarefas"]][:n_rounds]
+    source=json.loads((benchmark.ROOT/profile["task_file"]).read_text(encoding="utf-8"))["tarefas"][:n_rounds]
+    tasks=[t["id"] for t in source]
     malicious=set(store.NODES[:cases[scenario]["malicious_nodes"]])
     method=cases[scenario].get("mechanism","ema_slow_up")
     l=Ledger()
@@ -93,20 +124,24 @@ def fixture(root, *, missing_quorum=False, scenario="pilot"):
     }
     def node_seed(r,n):
         return int.from_bytes(hashlib.sha256(f"0:{r}:{n}".encode()).digest()[:8],"big")&((1<<63)-1)
+    # Real SQLite/writer format with a deterministic stand-in and fake GPU counters.
+    # No actual torch, network, snapshot, or CUDA is loaded by this regression test.
+    model=SimpleNamespace(dtype="torch.bfloat16",generation_config=SimpleNamespace(use_cache=True),
+                          get_memory_footprint=lambda:6_150_197_248)
+    standin=SimpleNamespace(model=model,sample=lambda *_a,**_kw:(42,"#### 42"))
+    counters=SimpleNamespace(get_device_name=lambda _: "offline test fake device",
+        memory_allocated=lambda _:6_150_197_248,memory_reserved=lambda _:6_400_000_000,
+        max_memory_allocated=lambda _:6_150_197_248,max_memory_reserved=lambda _:6_400_000_000)
     for n in store.NODES:
-        (root/"node-models"/n).mkdir()
-        db=root/"node-models"/n/"inferencias.sqlite"
-        with closing(sqlite3.connect(db)) as conn:
-            conn.executescript("""CREATE TABLE generations(round_index INTEGER PRIMARY KEY, node_id TEXT,task_id TEXT,seed INTEGER);
-                CREATE TABLE responses(round_index INTEGER PRIMARY KEY, answer TEXT);""")
-            for r,t in enumerate(tasks):
-                conn.execute("INSERT INTO generations VALUES(?,?,?,?)",(r,n,t,node_seed(r,n)))
-                conn.execute("INSERT INTO responses VALUES(?,?)",(r,"null" if omitted(r+1,n) else "42"))
-            conn.commit()
+        backend=DedicatedModel(node_id=n,run_id=boot["MODEL_RUN_ID"],model_name=boot["MODEL_NAME"],
+            cache_dir=root/"node-models"/n,dtype=boot["MODEL_DTYPE"],quantization=boot["MODEL_QUANTIZATION"],
+            device=boot["MODEL_DEVICE"],revision=boot["MODEL_REVISION"],factory=lambda:standin)
+        for r,t in enumerate(tasks):
+            backend.generate(round_index=r,task_id=t,question=source[r]["question"],seed=node_seed(r,n))
+            backend.record_response(r,None if omitted(r+1,n) else 42,n)
+        with patch.dict(sys.modules,{"torch":SimpleNamespace(cuda=counters)}):
+            backend._record_memory()
         files[f"ledgers/{n}.json"]=store.json_bytes(dict(node_id=n,valid=True,records=l.to_json()))
-        files[f"node-models/{n}/model-runtime.json"]=store.json_bytes(dict(
-            node_id=n,run_id=entry["id"],loaded_model_dtype="torch.bfloat16",dtype="bfloat16",quantization="none",
-            peak_reserved_bytes=6000000000,kv_cache=True))
     for name,data in files.items():
         (root/name).write_bytes(data)
     manifest=dict(run_id=RUN,status="verified_local",completed=True,run_kind=entry["run_kind"],scenario_id=scenario,
@@ -161,6 +196,38 @@ class Tests(unittest.TestCase):
             watchdog.Binding(RUN,"fake-provider-id","tcc",1000,100,30),receipt))
         self.assertEqual(self.upload(),receipt)
         self.assertEqual(self.calls,["PUT","GET"])
+
+    def test_archive_binds_worker_uuid_separately_from_experiment(self):
+        runtime_name=store.RUNTIME[0]
+        runtime_path=self.root/runtime_name
+        manifest_path=self.root/store.MANIFEST
+        original=runtime_path.read_bytes()
+        source=json.loads(original)
+        self.assertEqual(source["run_id"],RUN)
+        self.assertEqual(self.manifest["experiment_id"],EXPERIMENT)
+        self.assertNotEqual(source["run_id"],self.manifest["experiment_id"])
+
+        def install(meta):
+            runtime_path.write_bytes(store.json_bytes(meta))
+            manifest={**self.manifest,"artifacts_sha256":{
+                **self.manifest["artifacts_sha256"],runtime_name:store.sha(runtime_path.read_bytes())}}
+            manifest_path.write_bytes(store.json_bytes(manifest))
+
+        for mut in ({"run_id":EXPERIMENT},{"run_id":"a"*32},{"node_id":"node-1"}):
+            with self.subTest(delta=mut):
+                install({**source,**mut})
+                with self.assertRaisesRegex(ValueError,"another node or external run UUID"):
+                    self.upload()
+        install({**source,"loaded_model_dtype":"torch.float16"})
+        with self.assertRaisesRegex(ValueError,"actual BF16"):
+            self.upload()
+        runtime_path.write_bytes(original)
+        for manifest in ({**self.manifest,"experiment_id":RUN},
+                         {**self.manifest,"scenario":{**self.manifest["scenario"],"id":RUN}}):
+            manifest_path.write_bytes(store.json_bytes(manifest))
+            with self.assertRaisesRegex(ValueError,"Wrong experiment identity"):
+                self.upload()
+        self.assertEqual(self.calls,[])
 
     def test_corrupt_get_preserves_local_files_and_creates_no_receipt(self):
         def corrupt(req,timeout):
@@ -256,9 +323,9 @@ class Tests(unittest.TestCase):
 
 
     def test_official_outages_recover_exact_durable_zip_without_regeneration(self):
-        from unittest.mock import patch
         with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp)
+            root=store.durable_run(Path(temp),RUN)
+            root.mkdir()
             m=fixture(root,scenario="C13")
             self.assertEqual(m["verified_own_generations"],1000)
             official={**CFG,"prefix":"tcc/prod"}
@@ -302,7 +369,8 @@ class Tests(unittest.TestCase):
 
     def test_official_outage_before_put_landing_then_same_zip_is_sent(self):
         with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp)
+            root=store.durable_run(Path(temp),RUN)
+            root.mkdir()
             fixture(root,scenario="C11")
             cfg={**CFG,"prefix":"tcc/prod"}
             kwargs=dict(now=NOW,sleep=lambda _:None)

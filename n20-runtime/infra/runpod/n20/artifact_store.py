@@ -131,7 +131,7 @@ def _definition(m):
     if m.get("scenario",{}).get("nota") != row.get("score",profile["protocol"]["score"]):
         raise ValueError("Archived grading rule differs from scenario")
     expid = f"{'pilot' if kind=='pilot' else 'live'}-n20-r{n_rounds}-{tag}-s0"
-    if m.get("experiment_id") != expid:
+    if m.get("experiment_id") != expid or m.get("scenario",{}).get("id") != expid:
         raise ValueError("Wrong experiment identity")
     path = Path(__file__).resolve().parents[3] / profile["task_file"]
     raw = path.read_bytes().replace(b"\r\n",b"\n")
@@ -146,7 +146,8 @@ def validate_files(files, run_id):
         raise ValueError("Wrong artifact set")
     m = json.loads(files[MANIFEST])
     if (
-        m.get("run_id") != run_id or m.get("status") != "verified_local" or m.get("completed") is not True
+        not isinstance(run_id,str) or not RUN_ID.fullmatch(run_id)
+        or m.get("run_id") != run_id or m.get("status") != "verified_local" or m.get("completed") is not True
         or m.get("nodes") != 20 or m.get("model_is_stand_in") is not False or m.get("dtype") != "bfloat16"
         or m.get("quantization") != "none" or m.get("seed") != 0
         or m.get("model") != "HuggingFaceTB/SmolLM3-3B"
@@ -264,9 +265,12 @@ def validate_files(files, run_id):
             observed = [r["round_index"]+1 for r in l["records"] if r["kind"] in kinds]
             if observed != sorted(expected):
                 raise ValueError("Node ledger has wrong rounds or truth record")
+        # The worker binds DedicatedModel.MODEL_RUN_ID to the external UUID.
+        # The deterministic scenario identifier is validated separately in _definition.
+        if runtime.get("node_id") != n or runtime.get("run_id") != run_id:
+            raise ValueError("Node runtime belongs to another node or external run UUID")
         if (
-            runtime.get("node_id") != n or runtime.get("run_id") != m.get("experiment_id")
-            or runtime.get("loaded_model_dtype") != "torch.bfloat16" or runtime.get("quantization") != "none"
+            runtime.get("loaded_model_dtype") != "torch.bfloat16" or runtime.get("quantization") != "none"
             or runtime.get("dtype") != "bfloat16" or type(runtime.get("peak_reserved_bytes")) is not int
             or runtime["peak_reserved_bytes"] <= 0 or type(runtime.get("kv_cache")) is not bool
         ):
